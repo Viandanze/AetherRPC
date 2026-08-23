@@ -30,6 +30,9 @@ public:
 
     void start();
 
+    /// True once the listening socket is up (safe to connect).
+    bool listening() const;
+
     // --- configuration ---
     void setThreadNum(int numThreads);
     void setMaxConnections(int maxConn) { maxConnections_ = maxConn; }

@@ -17,7 +17,12 @@ namespace rpc {
 RpcChannel::RpcChannel(const std::shared_ptr<TcpConnection>& conn)
     : conn_(conn) {}
 
-RpcChannel::~RpcChannel() = default;
+RpcChannel::~RpcChannel() {
+    // Do not touch slot pointers here: callers that abandoned their
+    // calls are long gone. Dropping the slots is enough; pending
+    // closures that never ran are simply released with the channel.
+    pending_.clear();
+}
 
 void RpcChannel::CallMethod(
     const google::protobuf::MethodDescriptor* method,
@@ -37,30 +42,61 @@ void RpcChannel::CallMethod(
                 controller, done);
 }
 
-void RpcChannel::sendRequest(const std::string& serviceName,
-                             const std::string& methodName,
-                             const std::string& serializedArgs,
-                             google::protobuf::Message* response,
-                             google::protobuf::RpcController* controller,
-                             google::protobuf::Closure* done) {
-    uint32_t id = nextId_.fetch_add(1);
-    // Register the pending entry and write the frame on the IO thread so
-    // pending_ is single-threaded. Capture by value: runInLoop may execute
-    // asynchronously after this function has returned.
-    conn_->getLoop()->runInLoop([this, id, serviceName, methodName,
-                                 serializedArgs, response, controller,
-                                 done]() {
-        sendRequestInLoop(id, serviceName, methodName, serializedArgs,
-                          response, controller, done);
-    });
-}
-
-void RpcChannel::sendRequestInLoop(
-    uint32_t id, const std::string& serviceName,
-    const std::string& methodName, const std::string& serializedArgs,
-    google::protobuf::Message* response,
+RpcChannel::CallSlotPtr RpcChannel::sendRequest(
+    const std::string& serviceName, const std::string& methodName,
+    const std::string& serializedArgs, google::protobuf::Message* response,
     google::protobuf::RpcController* controller,
     google::protobuf::Closure* done) {
+    uint32_t id = nextId_.fetch_add(1);
+    if (id == 0) id = nextId_.fetch_add(1);  // skip the 0 sentinel on wrap
+
+    CallSlotPtr slot = std::make_shared<CallSlot>(id);
+    slot->response = response;
+    slot->controller = controller;
+    slot->done = done;
+
+    // Register the pending entry and write the frame on the IO thread so
+    // pending_ stays single-threaded. Capture the slot by value: it owns
+    // the call context, and its lock guards the raw pointers inside once
+    // published (the publish itself is ordered by the functor queue).
+    conn_->getLoop()->runInLoop(
+        [this, slot, serviceName, methodName, serializedArgs]() {
+            sendRequestInLoop(slot, serviceName, methodName, serializedArgs);
+        });
+    return slot;
+}
+
+void RpcChannel::cancelRequest(const CallSlotPtr& slot) {
+    if (slot == nullptr) return;
+
+    // Detach the caller-owned pointers under the slot lock. Every
+    // IO-thread path checks (and nulls) them under this same lock, so
+    // once this critical section completes, an in-flight completion has
+    // necessarily finished touching the caller's objects.
+    google::protobuf::Closure* done = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(slot->mtx);
+        slot->response = nullptr;
+        slot->controller = nullptr;
+        done = slot->done;
+        slot->done = nullptr;
+    }
+    if (done != nullptr) done->Run();  // releases the abandoned promise
+
+    // Hygiene: drop the map entry on the IO thread so abandoned entries
+    // do not accumulate while the connection stays healthy. Bounded risk:
+    // only the IO thread reads pending_, so a dead loop can never touch
+    // the entry either - it dies with the channel.
+    if (conn_ != nullptr && conn_->getLoop() != nullptr) {
+        conn_->getLoop()->queueInLoop(
+            [this, slot] { pending_.erase(slot->id); });
+    }
+}
+
+void RpcChannel::sendRequestInLoop(const CallSlotPtr& slot,
+                                   const std::string& serviceName,
+                                   const std::string& methodName,
+                                   const std::string& serializedArgs) {
     RpcRequest req;
     req.set_service_name(serviceName);
     req.set_method_name(methodName);
@@ -69,9 +105,9 @@ void RpcChannel::sendRequestInLoop(
     req.SerializeToString(&body);
 
     std::string frame;
-    RpcCodec::appendFrame(&frame, kRequest, id, body);
+    RpcCodec::appendFrame(&frame, kRequest, slot->id, body);
 
-    pending_[id] = PendingCall{response, controller, done};
+    pending_[slot->id] = slot;
     conn_->send(frame);
 }
 
@@ -98,40 +134,66 @@ void RpcChannel::onMessage(Buffer* buf) {
 
         auto it = pending_.find(header.requestId);
         if (it == pending_.end()) {
-            // Late reply for an already-timed-out call: nothing to do.
+            // Late reply for an already-cancelled call: nothing to do.
             LOG_WARN("RpcChannel: reply for unknown id=%u (timed out?)",
                      header.requestId);
             continue;
         }
-        PendingCall call = it->second;
+        CallSlotPtr slot = it->second;
         pending_.erase(it);
 
-        if (resp.error_code() == kOk) {
-            if (call.response != nullptr &&
-                !call.response->ParseFromString(resp.result())) {
-                if (call.controller != nullptr) {
-                    call.controller->SetFailed(
+        google::protobuf::Closure* done = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(slot->mtx);
+            done = slot->done;
+            slot->done = nullptr;
+            if (slot->response == nullptr) {
+                // Caller timed out and detached its objects already.
+                LOG_WARN("RpcChannel: late reply for cancelled id=%u, "
+                         "discarded",
+                         header.requestId);
+            } else if (resp.error_code() != kOk) {
+                if (slot->controller != nullptr) {
+                    slot->controller->SetFailed(
+                        "rpc error " + std::to_string(resp.error_code()) +
+                        ": " + resp.error_msg());
+                }
+                slot->response = nullptr;
+                slot->controller = nullptr;
+            } else if (!slot->response->ParseFromString(resp.result())) {
+                if (slot->controller != nullptr) {
+                    slot->controller->SetFailed(
                         "failed to parse business response");
                 }
-            }
-        } else {
-            if (call.controller != nullptr) {
-                call.controller->SetFailed(
-                    "rpc error " + std::to_string(resp.error_code()) + ": " +
-                    resp.error_msg());
+                slot->response = nullptr;
+                slot->controller = nullptr;
+            } else {
+                slot->response = nullptr;
+                slot->controller = nullptr;
             }
         }
-        if (call.done != nullptr) call.done->Run();
+        // Run user code outside the lock.
+        if (done != nullptr) done->Run();
     }
 }
 
 void RpcChannel::onDisconnect() {
     for (auto& kv : pending_) {
-        PendingCall& call = kv.second;
-        if (call.controller != nullptr) {
-            call.controller->SetFailed("connection closed");
+        const CallSlotPtr& slot = kv.second;
+        google::protobuf::Closure* done = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(slot->mtx);
+            done = slot->done;
+            slot->done = nullptr;
+            if (slot->response != nullptr) {  // not abandoned
+                if (slot->controller != nullptr) {
+                    slot->controller->SetFailed("connection closed");
+                }
+                slot->response = nullptr;
+                slot->controller = nullptr;
+            }
         }
-        if (call.done != nullptr) call.done->Run();
+        if (done != nullptr) done->Run();
     }
     pending_.clear();
 }

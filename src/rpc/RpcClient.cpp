@@ -8,7 +8,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <cstdio>
 #include <cstring>
 #include <future>
 
@@ -166,6 +165,16 @@ void RpcClient::closeConnection(const std::shared_ptr<TcpConnection>& conn) {
 void RpcClient::disconnect() {
     if (conn_ != nullptr) {
         std::shared_ptr<TcpConnection> conn = conn_;
+        // Arm the handshake BEFORE queueing forceClose. If the peer had
+        // already closed this connection, `closed_` is still true from
+        // that earlier round and the wait below would return instantly -
+        // BEFORE the freshly queued forceClose lambda (whose callbacks
+        // run on the IO thread and touch `this`) got a chance to run.
+        // Resetting first makes the wait cover THIS round of teardown.
+        {
+            std::lock_guard<std::mutex> lock(closeMtx_);
+            closed_ = false;
+        }
         conn->forceClose();  // triggers the close callback on the IO thread
         // Wait for the close callback to complete on the IO thread: the
         // channel/poller bookkeeping must finish before this object (and
@@ -200,13 +209,17 @@ bool RpcClient::syncCall(const std::string& serviceName,
     std::future<void> future = promise->get_future();
     RpcController controller;
 
-    channel_->sendRequest(serviceName, methodName, args, response, &controller,
-                          new PromiseDone(promise));
+    RpcChannel::CallSlotPtr slot =
+        channel_->sendRequest(serviceName, methodName, args, response,
+                              &controller, new PromiseDone(promise));
 
     auto status = future.wait_for(std::chrono::milliseconds(timeoutMs));
     if (status != std::future_status::ready) {
-        // The pending entry is left in the map; a late reply will find an
-        // abandoned promise (harmless set_value) and be discarded.
+        // Give up: detach response/controller from the channel BEFORE
+        // this stack frame dies, otherwise a late reply (or the
+        // disconnect sweep of a subsequent failover) would dereference
+        // dangling pointers.
+        channel_->cancelRequest(slot);
         if (error != nullptr) *error = "timeout";
         return false;
     }

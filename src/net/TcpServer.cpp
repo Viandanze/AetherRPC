@@ -27,6 +27,8 @@ void TcpServer::setThreadNum(int numThreads) {
     threadPool_->setThreadNum(numThreads);
 }
 
+bool TcpServer::listening() const { return acceptor_->listening(); }
+
 void TcpServer::start() {
     threadPool_->start();
 

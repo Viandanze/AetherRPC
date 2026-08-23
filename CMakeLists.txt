@@ -11,6 +11,11 @@ endif()
 find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
 
+# ZooKeeper C client (multi-threaded flavor) - Phase 2 dependency.
+find_path(ZOOKEEPER_INCLUDE_DIR zookeeper/zookeeper.h REQUIRED)
+find_library(ZOOKEEPER_MT_LIB NAMES zookeeper_mt REQUIRED)
+message(STATUS "ZooKeeper client: ${ZOOKEEPER_MT_LIB}")
+
 # ---------------------------------------------------------------------------
 # protobuf code generation
 # ---------------------------------------------------------------------------
@@ -40,11 +45,13 @@ add_custom_command(
 file(GLOB BASE_SRCS src/base/*.cpp)
 file(GLOB NET_SRCS src/net/*.cpp)
 file(GLOB RPC_SRCS src/rpc/*.cpp)
+file(GLOB ZK_SRCS src/zk/*.cpp)
 
 add_library(aetherrpc STATIC
     ${BASE_SRCS}
     ${NET_SRCS}
     ${RPC_SRCS}
+    ${ZK_SRCS}
     ${PROTO_SRCS}
     ${PROTO_HDRS})
 
@@ -52,7 +59,9 @@ target_include_directories(aetherrpc
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
            ${PROTO_GEN_DIR})
 target_link_libraries(aetherrpc
-    PUBLIC protobuf::libprotobuf Threads::Threads)
+    PUBLIC protobuf::libprotobuf Threads::Threads
+            ${ZOOKEEPER_MT_LIB})
+target_include_directories(aetherrpc PUBLIC ${ZOOKEEPER_INCLUDE_DIR})
 
 # ---------------------------------------------------------------------------
 # examples
@@ -62,6 +71,13 @@ target_link_libraries(echo_server PRIVATE aetherrpc)
 
 add_executable(echo_client examples/echo_client.cpp)
 target_link_libraries(echo_client PRIVATE aetherrpc)
+
+# Phase 2: ZooKeeper-backed distributed examples.
+add_executable(dist_echo_server examples/dist_echo_server.cpp)
+target_link_libraries(dist_echo_server PRIVATE aetherrpc)
+
+add_executable(dist_echo_client examples/dist_echo_client.cpp)
+target_link_libraries(dist_echo_client PRIVATE aetherrpc)
 
 # ---------------------------------------------------------------------------
 # tests

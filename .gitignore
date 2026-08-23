@@ -15,3 +15,4 @@ proto_gen/
 
 # OS
 .DS_Store
+.zkdev.sh

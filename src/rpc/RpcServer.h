@@ -42,6 +42,9 @@ public:
 
     void start();
 
+    /// True once the underlying listener is up (safe to connect).
+    bool listening() const { return server_.listening(); }
+
     /// Graceful teardown, must be invoked on the server loop thread
     /// (e.g. via loop->runInLoop): stop accepting, then force-close all
     /// remaining connections so their channels are removed from the

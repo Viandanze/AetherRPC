@@ -19,6 +19,13 @@ layering a custom binary RPC protocol and protobuf service dispatch on top.
 |   RpcClient    connection management + synchronous calls      |
 |   RpcCodec     frame encode/decode (half/sticky package safe) |
 +---------------------------------------------------------------+
+|  Distributed layer (src/rpc, src/zk)                          |
+|   RpcRegistry     server-side ZK registration (ephemeral)     |
+|   ServiceDiscovery  client-side endpoint watching (watchers)  |
+|   ServiceConsumer  discovery + LB + connection cache + retry  |
+|   LoadBalancer    round-robin / random endpoint selection     |
+|   ZkClient        thin thread-safe ZooKeeper C-API wrapper    |
++---------------------------------------------------------------+
 |  Network kernel (src/net, src/base) — inherited from Aether   |
 |   EventLoop / Epoller / Acceptor / TcpConnection / Buffer     |
 |   EventLoopThreadPool / TimerQueue / AsyncLogger              |
@@ -59,19 +66,29 @@ packages and sticky packages via length-prefix framing.
   matched by request id
 - **Clean error reporting** — unknown service/method, parse errors,
   timeouts and transport failures surface through the controller
+- **Service discovery (ZooKeeper)** — servers register as ephemeral
+  nodes; clients watch the service path and see endpoints come and go
+  live. Session loss triggers watcher re-arm and cache refresh
+- **Client-side load balancing** — round-robin or random, plug your own
+  `LoadBalancer` policy
+- **Connection cache with failover** — one multiplexed connection per
+  endpoint; on connect error / transport error / timeout the entry is
+  evicted and the call retried on a different endpoint (at-least-once
+  semantics — use idempotent services)
 - **Aether-grade transport** — multi-reactor with IO thread pool,
   non-blocking IO, TCP_NODELAY, idle timeouts, graceful shutdown
 
 ## Build
 
 Requirements: Linux, CMake >= 3.10, g++ >= 9 (C++17), protobuf (runtime +
-compiler).
+compiler), ZooKeeper C client (libzookeeper-mt-dev) for the distributed
+tests and examples.
 
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
-ctest            # 5 suites: buffer/inet/timestamp regression + codec + e2e
+ctest            # 7 suites: net regression + codec + rpc e2e + LB + zk
 ```
 
 ## Quick start
@@ -106,12 +123,67 @@ stub.Echo(nullptr, &req, &resp, done);
 
 Runnable versions: `examples/echo_server.cpp`, `examples/echo_client.cpp`.
 
+## Distributed usage (Phase 2)
+
+One `ZkClient` per process talks to ZooKeeper; servers register their
+endpoint as an ephemeral node under `/AetherRPC/<service>/<host:port>`,
+so a crashed server disappears automatically when its session expires.
+
+Server side:
+
+```cpp
+ZkClient zk("127.0.0.1:2181");
+zk.connect();
+RpcRegistry registry(&zk);            // basePath defaults to /AetherRPC
+// after the RpcServer is listening:
+registry.registerService("EchoService", "127.0.0.1:8101");
+```
+
+Client side — `ServiceConsumer` ties discovery, load balancing and a
+per-endpoint connection cache together:
+
+```cpp
+EventLoopThread loopThread;
+EventLoop* loop = loopThread.startLoop();
+ZkClient zk("127.0.0.1:2181");
+zk.connect();
+
+ServiceConsumer consumer(loop, &zk,
+                          std::make_unique<RoundRobinLoadBalancer>());
+EchoRequest req;  req.set_message("hello");
+EchoResponse resp;
+consumer.syncCall("EchoService", "Echo", req, &resp, 3000);
+```
+
+The first call installs the ZK watch; afterwards `syncCall` picks a
+live endpoint, reuses the cached connection, and on failure evicts it
+and retries on another endpoint (up to 3 attempts). Kill a server
+mid-run and calls keep succeeding on the survivors.
+
+Lifecycle rules (important):
+
+- the `EventLoop` backing the consumer must outlive the consumer —
+  declare `loopThread` before `consumer` and never quit the loop early;
+  `~EventLoopThread` quits and joins at the right time
+- shut the `ZkClient` down before the consumer's destructor runs (the
+  discovery worker tolerates a closed handle and exits promptly)
+
+Runnable versions: `examples/dist_echo_server.cpp`,
+`examples/dist_echo_client.cpp`:
+
+```bash
+./dist_echo_server 8101 & ./dist_echo_server 8102 & ./dist_echo_server 8103 &
+./dist_echo_client 12 127.0.0.1:2181
+```
+
 ## Roadmap
 
 - [x] Phase 1 — single-node RPC: custom protocol, protobuf dispatch,
       sync/async calls, error paths, e2e tests
-- [ ] Phase 2 — service discovery (ZooKeeper ephemeral nodes + watchers),
-      client-side load balancing
+- [x] Phase 2 — distributed: ZooKeeper service registration (ephemeral
+      nodes + watchers), client-side discovery cache, round-robin /
+      random load balancing, per-endpoint connection cache, failover
+      retries, distributed e2e tests with ASan
 - [ ] Phase 3 — timeouts, heartbeats, connection pooling, business-thread
       pool, non-blocking connector with reconnect, benchmarks vs gRPC
 
