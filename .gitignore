@@ -1,0 +1,17 @@
+# build
+build*/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# protobuf generated (also safe to keep out of VCS: built from proto/)
+proto_gen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

@@ -1,0 +1,19 @@
+// AetherRPC wire-level messages shared by framework internals.
+syntax = "proto3";
+
+package aether.rpc;
+
+// RpcRequest is the body of every REQUEST frame: it identifies the target
+// service/method and carries the serialized business request as opaque bytes.
+message RpcRequest {
+  string service_name = 1;
+  string method_name  = 2;
+  bytes  args         = 3;  // serialized business request message
+}
+
+// RpcResponse is the body of every RESPONSE frame.
+message RpcResponse {
+  int32  error_code = 1;  // 0 = OK, see RpcErrorCode in rpc/RpcProtocol.h
+  string error_msg  = 2;
+  bytes  result     = 3;  // serialized business response message
+}
