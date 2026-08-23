@@ -39,8 +39,11 @@ EventLoop::~EventLoop() {
 }
 
 void EventLoop::loop() {
+    // NOTE: do NOT reset quit_ here. A quit() that races with loop() entry
+    // (e.g. ~EventLoopThread quitting a loop whose thread has not yet entered
+    // loop()) must survive: resetting it here swallows the quit and the loop
+    // then parks in poll() forever, deadlocking the joining destructor.
     looping_ = true;
-    quit_ = false;
     LOG_INFO("EventLoop %p start looping", this);
 
     while (!quit_) {
