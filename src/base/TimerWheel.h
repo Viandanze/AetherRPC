@@ -13,9 +13,12 @@ class TcpConnection;
 /// TimerWheel: O(1) idle-connection timeout management
 ///
 /// Design:
-/// - Single-level wheel, one tick per second, N slots (N = timeout seconds + 1)
+/// - Single-level wheel, one tick per second, N slots (N = timeout seconds + 2)
 /// - Each slot holds (weak_ptr<TcpConnection>, generation) pairs
-/// - On activity, insert into slot (current + timeout) % capacity
+/// - On activity, insert into slot (current + timeout + 1) % capacity;
+///   the extra slot of slack guarantees the entry is inspected strictly
+///   MORE than `timeout` seconds after the last activity (reap is at most
+///   1 second late, never early)
 /// - On tick, check the current slot: generation match -> idle timeout -> shutdown; mismatch -> stale entry -> ignore
 /// - Refreshing is just ++generation then re-insert; old entries invalidate themselves
 ///

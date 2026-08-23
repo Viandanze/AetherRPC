@@ -22,6 +22,12 @@ public:
 
     void handleEvent();  // core: dispatch callbacks based on revents_
 
+    // Tie the Channel's lifetime to its owner (TcpConnection). handleEvent()
+    // takes a shared_ptr from the tie before dispatching, so a connection
+    // destroyed while its events sit in the epoll_wait batch cannot be
+    // touched through a stale Channel (classic muduo tie pattern).
+    void tie(const std::shared_ptr<void>&);
+
     // set callbacks
     void setReadCallback(ReadEventCallback cb) { readCallback_ = std::move(cb); }
     void setWriteCallback(EventCallback cb)    { writeCallback_ = std::move(cb); }
@@ -63,6 +69,9 @@ private:
     int events_;     // registered events
     int revents_;    // ready events returned by epoll
     int index_;      // state in the epoller
+
+    std::weak_ptr<void> tie_;  // owner (TcpConnection) when tied_
+    bool tied_ = false;
 
     ReadEventCallback readCallback_;
     EventCallback writeCallback_;

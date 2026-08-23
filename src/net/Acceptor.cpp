@@ -22,13 +22,23 @@ Acceptor::Acceptor(EventLoop* loop, const InetAddress& listenAddr, bool reusePor
 }
 
 Acceptor::~Acceptor() {
-    acceptChannel_->disableAll();
-    acceptChannel_->remove();
+    // When stopListening() already closed the socket and removed the
+    // channel, touching the channel again would re-register a closed fd
+    // in the poller (EBADF).
+    if (acceptSocket_ != nullptr) {
+        acceptChannel_->disableAll();
+        acceptChannel_->remove();
+    }
     ::close(idleFd_);
 }
 
 void Acceptor::listen() {
     loop_->assertInLoopThread();
+    if (acceptSocket_ == nullptr) {
+        // re-listening after stopListening() is not supported
+        LOG_ERROR("Acceptor::listen() after stopListening(): socket closed");
+        return;
+    }
     listening_ = true;
     acceptSocket_->listen();
     acceptChannel_->enableReading();
@@ -36,9 +46,18 @@ void Acceptor::listen() {
 
 void Acceptor::stopListening() {
     loop_->assertInLoopThread();
+    if (!listening_) return;
     listening_ = false;
-    acceptChannel_->disableReading();
-    LOG_INFO("Acceptor: stopped listening");
+    // A "stopped" server must refuse new connections: merely disabling
+    // the epoll watch leaves the listening fd open, so fresh connects
+    // still complete the TCP handshake into the accept backlog and then
+    // black-hole (nobody ever accept()s them). During graceful shutdown
+    // that traps clients into waiting out their full call deadline. Close
+    // the socket so connects fail fast with ECONNREFUSED.
+    acceptChannel_->disableAll();
+    acceptChannel_->remove();
+    acceptSocket_.reset();
+    LOG_INFO("Acceptor: stopped listening (socket closed)");
 }
 
 void Acceptor::handleRead() {

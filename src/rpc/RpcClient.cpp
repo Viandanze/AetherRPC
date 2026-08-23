@@ -19,6 +19,7 @@
 #include "net/Socket.h"
 #include "net/TcpConnection.h"
 #include "rpc/RpcChannel.h"
+#include "rpc/RpcCodec.h"
 #include "rpc/RpcController.h"
 
 namespace aether {
@@ -62,6 +63,10 @@ RpcClient::~RpcClient() { disconnect(); }
 
 bool RpcClient::connect(int timeoutMs) {
     if (connected()) return true;
+    // poll(2): 0 = "return immediately", NOT "wait forever" - so a
+    // non-positive timeout must be mapped to a real default, otherwise
+    // every in-progress connect would instantly report failure.
+    if (timeoutMs <= 0) timeoutMs = 3000;
 
     const struct sockaddr_in& addr = serverAddr_.getSockAddr();
 
@@ -115,6 +120,8 @@ bool RpcClient::connect(int timeoutMs) {
                                                 serverAddr_);
     conn->setTcpNoDelay(true);
     channel_ = std::make_shared<RpcChannel>(conn);
+    // Pongs reset the heartbeat miss counter (dead-peer detection).
+    channel_->setOnHeartbeat([this]() { hbMisses_.store(0); });
     conn->setMessageCallback(
         [this](const std::shared_ptr<TcpConnection>&, Buffer* buf) {
             channel_->onMessage(buf);
@@ -123,10 +130,6 @@ bool RpcClient::connect(int timeoutMs) {
         [this](const std::shared_ptr<TcpConnection>& c) { closeConnection(c); });
 
     conn_ = conn;
-    {
-        std::lock_guard<std::mutex> lock(closeMtx_);
-        closed_ = false;
-    }
 
     // connectEstablished() runs asynchronously on the IO thread; wait for
     // it so that connect() returning true implies a usable connection
@@ -155,34 +158,47 @@ void RpcClient::closeConnection(const std::shared_ptr<TcpConnection>& conn) {
     if (conn_ == conn) {
         conn_.reset();
     }
-    {
-        std::lock_guard<std::mutex> lock(closeMtx_);
-        closed_ = true;
-    }
-    closeCv_.notify_all();
 }
 
 void RpcClient::disconnect() {
-    if (conn_ != nullptr) {
-        std::shared_ptr<TcpConnection> conn = conn_;
-        // Arm the handshake BEFORE queueing forceClose. If the peer had
-        // already closed this connection, `closed_` is still true from
-        // that earlier round and the wait below would return instantly -
-        // BEFORE the freshly queued forceClose lambda (whose callbacks
-        // run on the IO thread and touch `this`) got a chance to run.
-        // Resetting first makes the wait cover THIS round of teardown.
-        {
-            std::lock_guard<std::mutex> lock(closeMtx_);
-            closed_ = false;
-        }
-        conn->forceClose();  // triggers the close callback on the IO thread
-        // Wait for the close callback to complete on the IO thread: the
-        // channel/poller bookkeeping must finish before this object (and
-        // the connection it references) goes away.
-        std::unique_lock<std::mutex> lock(closeMtx_);
-        closeCv_.wait_for(lock, std::chrono::seconds(3),
-                          [this] { return closed_; });
+    if (loop_ == nullptr) return;  // never had an IO thread: nothing to drain
+
+    hbCancelled_.store(true);
+    std::shared_ptr<TcpConnection> conn = conn_;
+
+    // Single teardown functor queued on the IO loop. It is the LAST work
+    // item we queue that touches `this`, so the handshake below waits for
+    // IT - not merely for the connection's close callback, which a
+    // peer-initiated close can satisfy while this functor is still
+    // pending (use-after-free on the freed RpcClient).
+    {
+        std::lock_guard<std::mutex> lock(closeMtx_);
+        drained_ = false;
     }
+    loop_->queueInLoop([this, conn]() {
+        // hbArmed_/hbTimerId_ are IO-thread-only state.
+        if (hbArmed_) {
+            loop_->cancel(hbTimerId_);
+            hbArmed_ = false;
+        }
+        if (conn != nullptr && !conn->disconnected()) {
+            // forceClose() uses runInLoop, which runs INLINE on the IO
+            // thread: by the time it returns, handleClose ->
+            // closeConnection has fully torn the connection down
+            // (channel cleanup, pending-call failure, conn_ reset).
+            conn->forceClose();
+        }
+        std::lock_guard<std::mutex> lock(closeMtx_);
+        drained_ = true;
+        closeCv_.notify_all();
+    });
+
+    // Unconditional handshake: the functor touches `this` even without a
+    // connection (heartbeat-only teardown), so destruction must wait for
+    // it in every case. Bounded wait in case the IO thread is gone.
+    std::unique_lock<std::mutex> lock(closeMtx_);
+    closeCv_.wait_for(lock, std::chrono::seconds(3),
+                      [this] { return drained_; });
 }
 
 google::protobuf::RpcChannel* RpcClient::channel() {
@@ -209,19 +225,31 @@ bool RpcClient::syncCall(const std::string& serviceName,
     std::future<void> future = promise->get_future();
     RpcController controller;
 
+    // The channel arms an IO-thread deadline of `timeoutMs`; on expiry
+    // the call completes with kTimeout ("timeout") through the normal
+    // done-callback path - the same one async callers go through.
     RpcChannel::CallSlotPtr slot =
         channel_->sendRequest(serviceName, methodName, args, response,
-                              &controller, new PromiseDone(promise));
+                              &controller, new PromiseDone(promise),
+                              timeoutMs);
 
-    auto status = future.wait_for(std::chrono::milliseconds(timeoutMs));
-    if (status != std::future_status::ready) {
-        // Give up: detach response/controller from the channel BEFORE
-        // this stack frame dies, otherwise a late reply (or the
-        // disconnect sweep of a subsequent failover) would dereference
-        // dangling pointers.
-        channel_->cancelRequest(slot);
-        if (error != nullptr) *error = "timeout";
-        return false;
+    if (timeoutMs > 0) {
+        // Grace window for the IO-side timeout to resolve the promise;
+        // only a stalled/dead IO thread falls through to the manual
+        // abandon path below.
+        auto status = future.wait_for(
+            std::chrono::milliseconds(timeoutMs + 500));
+        if (status != std::future_status::ready) {
+            // Give up: detach response/controller from the channel BEFORE
+            // this stack frame dies, otherwise a late reply (or the
+            // disconnect sweep of a subsequent failover) would
+            // dereference dangling pointers.
+            channel_->cancelRequest(slot);
+            if (error != nullptr) *error = "timeout";
+            return false;
+        }
+    } else {
+        future.wait();
     }
 
     if (controller.Failed()) {
@@ -229,6 +257,39 @@ bool RpcClient::syncCall(const std::string& serviceName,
         return false;
     }
     return true;
+}
+
+void RpcClient::enableHeartbeat(double intervalSec, int maxMissed) {
+    hbRequested_.store(true);
+    hbMaxMissed_ = maxMissed;
+    hbMisses_.store(0);
+    // Arm on the IO loop: runEvery itself only arms the timerfd, but the
+    // hbArmed_/hbTimerId_ bookkeeping must stay IO-thread-only, and the
+    // hbCancelled_ check must be evaluated on the loop (see disconnect).
+    loop_->runInLoop([this, intervalSec]() {
+        if (hbCancelled_.load() || hbArmed_) return;
+        hbArmed_ = true;
+        hbTimerId_ =
+            loop_->runEvery(intervalSec, [this]() { heartbeatTick(); });
+    });
+}
+
+void RpcClient::heartbeatTick() {
+    if (conn_ == nullptr || !conn_->connected()) {
+        return;  // between connections; counting resumes on reconnect
+    }
+    // fetch_add returns the PRE-increment value: with maxMissed = 3 the
+    // client sends 3 unanswered pings and reaps on the 4th tick.
+    if (hbMisses_.fetch_add(1) >= hbMaxMissed_) {
+        LOG_WARN("RpcClient[%s]: %d heartbeats unanswered, closing %s",
+                 name_.c_str(), hbMaxMissed_,
+                 serverAddr_.toIpPort().c_str());
+        conn_->forceClose();
+        return;
+    }
+    std::string ping;
+    RpcCodec::appendFrame(&ping, kHeartbeat, 0, std::string());
+    conn_->send(ping);
 }
 
 }  // namespace rpc

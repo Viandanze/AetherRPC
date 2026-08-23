@@ -78,8 +78,13 @@ void TcpServer::newConnection(int fd, const InetAddress& peerAddr) {
         removeConnection(c);
     });
 
-    // finish connection setup in the IO thread
-    ioLoop->runInLoop([conn]() { conn->connectEstablished(); });
+    // finish connection setup in the IO thread; also register the
+    // connection with that loop's idle wheel (no-op when no idle timeout
+    // is configured). TcpConnection::handleRead refreshes it on traffic.
+    ioLoop->runInLoop([conn, ioLoop]() {
+        conn->connectEstablished();
+        ioLoop->insertToWheel(conn);
+    });
 
     LOG_INFO("New connection [%s] from %s -> loop %p (total: %zu)",
              connName.c_str(), peerAddr.toIpPort().c_str(), ioLoop,

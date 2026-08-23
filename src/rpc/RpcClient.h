@@ -2,6 +2,7 @@
 #define AETHER_RPC_CLIENT_H
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 
+#include "base/TimerId.h"
 #include "base/noncopyable.h"
 #include "net/InetAddress.h"
 #include "net/TcpConnection.h"
@@ -57,17 +59,29 @@ public:
 
     /// Synchronous call: blocks until the reply arrives or the deadline
     /// hits. Returns false on timeout / transport error; a failed RPC
-    /// (service not found, ...) also returns false.
+    /// (service not found, ...) also returns false. `timeoutMs <= 0`
+    /// disables the deadline (wait forever).
     bool syncCall(const std::string& serviceName,
                   const std::string& methodName,
                   const google::protobuf::Message& request,
                   google::protobuf::Message* response, int timeoutMs = 3000,
                   std::string* error = nullptr);
 
+    /// Enable connection keepalive (Phase 3): send an empty HEARTBEAT
+    /// frame every `intervalSec` seconds; a pong resets the miss
+    /// counter. After `maxMissed` consecutive unanswered intervals the
+    /// peer is considered dead and the connection is force-closed (so
+    /// callers see the failure instead of hanging on a black hole).
+    ///
+    /// Call after a successful connect(). The timer lives on the IO
+    /// loop and survives reconnects.
+    void enableHeartbeat(double intervalSec, int maxMissed = 3);
+
     const InetAddress& serverAddr() const { return serverAddr_; }
 
 private:
     void closeConnection(const std::shared_ptr<TcpConnection>& conn);
+    void heartbeatTick();  // IO thread: send ping / reap dead peer
 
     EventLoop* loop_;
     const InetAddress serverAddr_;
@@ -76,11 +90,26 @@ private:
     std::shared_ptr<TcpConnection> conn_;
     std::shared_ptr<RpcChannel> channel_;
 
-    // disconnect() synchronously waits for the close callback on the IO
-    // thread via this handshake.
+    // Heartbeat state. hbArmed_/hbTimerId_ are IO-thread-only; the
+    // atomics arbitrate the arm-vs-teardown race (a heartbeat requested
+    // right before destruction must never arm after the dtor finished).
+    std::atomic<int> hbMisses_{0};
+    std::atomic<bool> hbRequested_{false};
+    std::atomic<bool> hbCancelled_{false};
+    int hbMaxMissed_ = 3;
+    bool hbArmed_ = false;  // IO thread only
+    TimerId hbTimerId_{};   // IO thread only
+
+    // disconnect() handshake. drained_ is set ONLY by the teardown
+    // functor disconnect() queues on the IO loop, and disconnect() waits
+    // on it before returning: the functor touches `this` (heartbeat
+    // bookkeeping, close callbacks) even when there is no connection, so
+    // ~RpcClient must never overtake it. Waiting on the connection's own
+    // "closed" state instead would be racy: a peer-initiated close can
+    // satisfy it while the teardown functor is still pending.
     std::mutex closeMtx_;
     std::condition_variable closeCv_;
-    bool closed_ = true;
+    bool drained_ = true;
 };
 
 }  // namespace rpc

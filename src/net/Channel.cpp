@@ -18,7 +18,25 @@ Channel::Channel(EventLoop* loop, int fd)
 
 Channel::~Channel() {}
 
+void Channel::tie(const std::shared_ptr<void>& owner) {
+    tie_ = owner;
+    tied_ = true;
+}
+
 void Channel::handleEvent() {
+    // If tied, keep the owner alive for the duration of the dispatch.
+    // epoll_wait can return a batch of active channels; tearing down one
+    // connection may destroy another whose Channel is still in this batch.
+    // A failed lock means the owner is gone: skip the stale event.
+    std::shared_ptr<void> guard;
+    if (tied_) {
+        guard = tie_.lock();
+        if (!guard) {
+            LOG_DEBUG("Channel::handleEvent fd=%d skipped: owner gone", fd_);
+            return;
+        }
+    }
+
     if (revents_ & (EPOLLERR)) {
         if (errorCallback_) errorCallback_();
     }

@@ -5,7 +5,7 @@
 
 TimerWheel::TimerWheel(EventLoop* loop, int timeoutSeconds)
     : timeoutSeconds_(timeoutSeconds),
-      capacity_(static_cast<size_t>(timeoutSeconds) + 1),
+      capacity_(static_cast<size_t>(timeoutSeconds) + 2),
       current_(0),
       loop_(loop),
       wheel_(capacity_) {
@@ -28,7 +28,13 @@ void TimerWheel::stop() {
 void TimerWheel::insert(const std::shared_ptr<TcpConnection>& conn) {
     // bump generation so older entries become stale
     uint64_t gen = ++conn->idleTimerGeneration();
-    size_t slot = (current_ + static_cast<size_t>(timeoutSeconds_)) % capacity_;
+    // Slot math: an entry inserted into slot (current + timeout + 1) is
+    // inspected (timeout + 1) ticks later, i.e. between timeout and
+    // timeout + 1 seconds after the insert. Insertions can happen at any
+    // sub-second offset inside a tick interval, so the +1 slack keeps the
+    // inspection strictly later than `timeout` seconds -- a connection is
+    // never reaped before it has truly been idle for `timeout` seconds.
+    size_t slot = (current_ + static_cast<size_t>(timeoutSeconds_) + 1) % capacity_;
     wheel_[slot].push_back({conn, gen});
 }
 

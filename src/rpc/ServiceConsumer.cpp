@@ -64,8 +64,29 @@ bool ServiceConsumer::syncCall(const std::string& service,
         }
     }
 
+    // Total budget across connect + call for every attempt. A budget of
+    // <= 0 means "no deadline" and is passed through to RpcClient.
+    const bool bounded = timeoutMs > 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    auto remainingMs = [&]() -> int {
+        if (!bounded) return 0;  // unbounded: pass through
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now())
+                        .count();
+        return static_cast<int>(left);
+    };
+
     std::set<std::string> tried;
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        int left = remainingMs();
+        if (bounded && left < 50) {
+            // Budget exhausted: no point starting another attempt that
+            // cannot finish inside the caller's deadline.
+            if (error) *error = "timeout";
+            return false;
+        }
+
         std::vector<std::string> candidates =
             exclude(discovery_.endpoints(service), tried);
         if (candidates.empty()) {
@@ -76,14 +97,15 @@ bool ServiceConsumer::syncCall(const std::string& service,
         std::string addr = lb_->select(candidates);
         if (addr.empty()) continue;
 
-        std::shared_ptr<RpcClient> client = connectionFor(addr);
+        int connectMs = bounded ? std::min(left, kConnectBudgetMs) : 0;
+        std::shared_ptr<RpcClient> client = connectionFor(addr, connectMs);
         if (client == nullptr) {
             tried.insert(addr);
             continue;
         }
 
-        if (client->syncCall(service, method, request, response, timeoutMs,
-                             error)) {
+        if (client->syncCall(service, method, request, response,
+                             remainingMs(), error)) {
             return true;
         }
 
@@ -96,7 +118,7 @@ bool ServiceConsumer::syncCall(const std::string& service,
 }
 
 std::shared_ptr<RpcClient> ServiceConsumer::connectionFor(
-    const std::string& addr) {
+    const std::string& addr, int connectTimeoutMs) {
     {
         std::lock_guard<std::mutex> lock(connMtx_);
         auto it = conns_.find(addr);
@@ -106,7 +128,7 @@ std::shared_ptr<RpcClient> ServiceConsumer::connectionFor(
     InetAddress serverAddr = parseAddr(addr);
     auto client = std::make_shared<RpcClient>(loop_, serverAddr,
                                               "consumer-" + addr);
-    if (!client->connect()) return nullptr;
+    if (!client->connect(connectTimeoutMs)) return nullptr;
 
     std::lock_guard<std::mutex> lock(connMtx_);
     // First caller to connect wins; ours goes to the cache (and gets

@@ -1,0 +1,321 @@
+// Phase 3 end-to-end tests: per-call deadlines (sync + async stub),
+// heartbeat keepalive vs server idle timeout, dead-peer detection, and
+// the business-thread pool.
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <functional>
+#include <future>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <google/protobuf/service.h>
+
+#include "net/EventLoop.h"
+#include "net/EventLoopThread.h"
+#include "net/InetAddress.h"
+#include "net/TcpServer.h"
+#include "rpc/RpcChannel.h"
+#include "rpc/RpcClient.h"
+#include "rpc/RpcController.h"
+#include "rpc/RpcProtocol.h"
+#include "rpc/RpcServer.h"
+#include "test_framework.h"
+#include "echo.pb.h"
+
+using namespace aether::rpc;
+using namespace std::chrono_literals;
+
+namespace {
+
+const uint16_t kPortTimeout    = 18931;
+const uint16_t kPortAsync      = 18932;
+const uint16_t kPortKeepalive  = 18933;
+const uint16_t kPortIdle       = 18934;
+const uint16_t kPortDeadPeer   = 18935;
+const uint16_t kPortWorkers    = 18936;
+
+class FunctionClosure : public google::protobuf::Closure {
+public:
+    explicit FunctionClosure(std::function<void()> fn) : fn_(std::move(fn)) {}
+    void Run() override {
+        if (fn_) fn_();
+        delete this;
+    }
+private:
+    std::function<void()> fn_;
+};
+
+/// Echo handler that sleeps before replying: exercises deadlines and
+/// worker-pool parallelism.
+class SlowEchoServiceImpl final : public ::aether::rpc::example::EchoService {
+public:
+    explicit SlowEchoServiceImpl(int delayMs) : delayMs_(delayMs) {}
+    void Echo(google::protobuf::RpcController*,
+              const ::aether::rpc::example::EchoRequest* request,
+              ::aether::rpc::example::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs_));
+        response->set_message(request->message());
+        if (done != nullptr) done->Run();
+    }
+private:
+    int delayMs_;
+};
+
+class EchoServiceImpl final : public ::aether::rpc::example::EchoService {
+public:
+    void Echo(google::protobuf::RpcController*,
+              const ::aether::rpc::example::EchoRequest* request,
+              ::aether::rpc::example::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        response->set_message(request->message());
+        if (done != nullptr) done->Run();
+    }
+};
+
+/// Poll `pred` every 10ms until true or `timeoutMs` elapses.
+bool waitFor(const std::function<bool()>& pred, int timeoutMs) {
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
+/// Connect with retries (the server may still be binding its port).
+bool connectWithRetry(RpcClient* client) {
+    for (int i = 0; i < 200; ++i) {
+        if (client->connect()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+}  // namespace
+
+void test_sync_call_timeout() {
+    TEST_SUITE("Timeout: sync call hits the channel deadline");
+
+    SlowEchoServiceImpl slow(300);
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortTimeout), "timeout-server");
+    server->registerService(&slow);
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortTimeout));
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    example::EchoRequest req;
+    req.set_message("deadline");
+    example::EchoResponse resp;
+    std::string error;
+
+    auto t0 = std::chrono::steady_clock::now();
+    bool ok = client.syncCall("EchoService", "Echo", req, &resp, 150, &error);
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    ASSERT_FALSE(ok);
+    ASSERT_CONTAINS(error, "timeout");
+    // The 150ms deadline must beat the 300ms handler; 450ms allows for
+    // timer/scheduling slack without waiting the full handler time.
+    ASSERT_TRUE(elapsed < 450);
+
+    // Plenty of budget: the call succeeds.
+    ok = client.syncCall("EchoService", "Echo", req, &resp, 2000, &error);
+    ASSERT_TRUE(ok);
+    ASSERT_STREQ(resp.message(), "deadline");
+}
+
+void test_async_stub_timeout() {
+    TEST_SUITE("Timeout: async stub deadline + late reply discarded");
+
+    SlowEchoServiceImpl slow(300);
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortAsync), "async-timeout-server");
+    server->registerService(&slow);
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortAsync));
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    // Stub-driven calls carry no explicit timeout: the channel-wide
+    // default deadline covers them.
+    auto* ch = static_cast<RpcChannel*>(client.channel());
+    ch->setDefaultTimeoutMs(150);
+
+    example::EchoService::Stub stub(ch);
+    example::EchoRequest req;
+    req.set_message("async-deadline");
+    example::EchoResponse resp;
+    RpcController controller;
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = promise->get_future();
+    stub.Echo(&controller, &req, &resp,
+              new FunctionClosure([promise]() { promise->set_value(); }));
+
+    ASSERT_TRUE(future.wait_for(2s) == std::future_status::ready);
+    ASSERT_TRUE(controller.Failed());
+    ASSERT_EQ(controller.ErrorCode(), kTimeout);
+    ASSERT_CONTAINS(controller.ErrorText(), "timeout");
+
+    // The late reply (handler finishes at ~300ms) must be discarded
+    // without touching the detached response/controller. The ASan build
+    // guards the memory-safety half of this assertion.
+    std::this_thread::sleep_for(500ms);
+    ASSERT_STREQ(resp.message(), "");
+}
+
+void test_heartbeat_keeps_idle_connection_alive() {
+    TEST_SUITE("Heartbeat: keepalive beats server idle timeout");
+
+    EchoServiceImpl echo;
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortKeepalive), "keepalive-server");
+    server->registerService(&echo);
+    server->setIdleTimeout(1);  // reap after 1s of silence
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortKeepalive));
+    ASSERT_TRUE(connectWithRetry(&client));
+    client.enableHeartbeat(0.3, 3);
+
+    // Idle timeout is 1s; heartbeats every 300ms keep the connection
+    // alive through 3s of RPC silence.
+    std::this_thread::sleep_for(3s);
+
+    example::EchoRequest req;
+    req.set_message("still-alive");
+    example::EchoResponse resp;
+    std::string error;
+    ASSERT_TRUE(client.syncCall("EchoService", "Echo", req, &resp, 2000,
+                                &error));
+    ASSERT_STREQ(resp.message(), "still-alive");
+    ASSERT_EQ(server->connectionCount(), 1);
+}
+
+void test_idle_timeout_without_heartbeat() {
+    TEST_SUITE("Idle timeout: silent connection is reaped");
+
+    EchoServiceImpl echo;
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortIdle), "idle-server");
+    server->registerService(&echo);
+    server->setIdleTimeout(1);
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortIdle));
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    example::EchoRequest req;
+    req.set_message("first");
+    example::EchoResponse resp;
+    ASSERT_TRUE(client.syncCall("EchoService", "Echo", req, &resp, 2000,
+                                nullptr));
+
+    // No heartbeat: after ~1-2s of silence the server reaps the
+    // connection; the client observes the close.
+    ASSERT_TRUE(waitFor([&] { return server->connectionCount() == 0; },
+                        4000));
+    ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 1000));
+}
+
+void test_dead_peer_detection() {
+    TEST_SUITE("Heartbeat: unanswered pings close the connection");
+
+    // A raw TcpServer with no RPC layer: heartbeat frames are never
+    // answered (black hole).
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    TcpServer rawServer(serverLoop, InetAddress(kPortDeadPeer),
+                        "black-hole");
+    serverLoop->runInLoop([&] { rawServer.start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortDeadPeer));
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    // 200ms interval, 2 misses allowed: detection within ~0.6-1s.
+    client.enableHeartbeat(0.2, 2);
+    ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 2000));
+}
+
+void test_worker_pool_concurrency() {
+    TEST_SUITE("Business thread pool: slow handlers run in parallel");
+
+    SlowEchoServiceImpl slow(300);
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortWorkers), "worker-server");
+    server->registerService(&slow);
+    server->setWorkerThreads(4);
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortWorkers));
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    // 8 concurrent calls over one multiplexed connection. Serialized on
+    // the IO thread they would take >= 8 x 300ms = 2400ms; with 4
+    // workers ~600ms. 1500ms separates the two regimes under sandbox
+    // jitter.
+    constexpr int kCalls = 8;
+    std::vector<std::thread> threads;
+    std::atomic<int> okCount{0};
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kCalls; ++i) {
+        threads.emplace_back([&, i]() {
+            example::EchoRequest req;
+            req.set_message("call-" + std::to_string(i));
+            example::EchoResponse resp;
+            if (client.syncCall("EchoService", "Echo", req, &resp, 5000)) {
+                if (resp.message() == "call-" + std::to_string(i)) {
+                    okCount.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+
+    ASSERT_EQ(okCount.load(), kCalls);
+    ASSERT_TRUE(elapsed < 1500);
+}
+
+int main() {
+    test_sync_call_timeout();
+    test_async_stub_timeout();
+    test_heartbeat_keeps_idle_connection_alive();
+    test_idle_timeout_without_heartbeat();
+    test_dead_peer_detection();
+    test_worker_pool_concurrency();
+    TEST_SUMMARY();
+}

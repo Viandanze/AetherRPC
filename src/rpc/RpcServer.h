@@ -8,6 +8,7 @@
 
 #include <google/protobuf/service.h>
 
+#include "base/ThreadPool.h"
 #include "base/noncopyable.h"
 #include "net/InetAddress.h"
 #include "net/TcpServer.h"
@@ -58,6 +59,17 @@ public:
     void setMaxConnections(int n) { server_.setMaxConnections(n); }
     void setIdleTimeout(int seconds) { server_.setIdleTimeout(seconds); }
 
+    /// Business-thread pool (Phase 3): with n > 0, service handlers run
+    /// on n worker threads instead of the connection's IO thread, so a
+    /// slow handler never blocks other connections (or other calls
+    /// multiplexed on the same connection). Replies hop back to the IO
+    /// thread automatically. Handlers must run their done-callback
+    /// before returning (synchronous handlers). Call before start().
+    void setWorkerThreads(int n) { workerThreads_ = n; }
+
+    /// Live connection count (from the underlying TcpServer).
+    int connectionCount() const { return server_.connectionCount(); }
+
     void registerService(google::protobuf::Service* service);
 
 private:
@@ -79,6 +91,8 @@ private:
 
     TcpServer server_;
     std::unordered_map<std::string, google::protobuf::Service*> services_;
+    int workerThreads_ = 0;
+    std::unique_ptr<base::ThreadPool> workers_;  // null = inline dispatch
 };
 
 }  // namespace rpc

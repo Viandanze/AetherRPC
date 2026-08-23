@@ -75,6 +75,16 @@ packages and sticky packages via length-prefix framing.
   endpoint; on connect error / transport error / timeout the entry is
   evicted and the call retried on a different endpoint (at-least-once
   semantics — use idempotent services)
+- **Per-call deadlines** — every pending call arms a deadline on the IO
+  loop; expiry fails the call through the normal completion path, and
+  retries share one total budget instead of resetting it per attempt
+- **Keepalive and dead-peer detection** — configurable ping interval /
+  missed-ping limit force-closes a silent connection so callers fail
+  fast instead of hanging on a black hole; the server reaps idle
+  connections with an O(1) timing wheel
+- **Business-thread pool** — slow service handlers run on a dedicated
+  worker pool (`RpcServer::setWorkerThreads()`), keeping the IO loops
+  responsive
 - **Aether-grade transport** — multi-reactor with IO thread pool,
   non-blocking IO, TCP_NODELAY, idle timeouts, graceful shutdown
 
@@ -184,8 +194,14 @@ Runnable versions: `examples/dist_echo_server.cpp`,
       nodes + watchers), client-side discovery cache, round-robin /
       random load balancing, per-endpoint connection cache, failover
       retries, distributed e2e tests with ASan
-- [ ] Phase 3 — timeouts, heartbeats, connection pooling, business-thread
-      pool, non-blocking connector with reconnect, benchmarks vs gRPC
+- [ ] Phase 3 — production hardening (in progress):
+  - [x] Per-call deadlines with a shared retry budget
+  - [x] Connection keepalive + dead-peer detection (ping/pong, miss
+        counting), server-side idle-connection reaping (timing wheel)
+  - [x] Business-thread pool: slow service handlers run off the IO loop
+  - [ ] Connection pooling (per-endpoint pool with failover)
+  - [ ] Non-blocking connector with automatic reconnect
+  - [ ] Benchmarks vs gRPC
 
 ## License
 

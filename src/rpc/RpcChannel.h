@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include <google/protobuf/service.h>
 
+#include "base/TimerId.h"
 #include "base/noncopyable.h"
 
 class Buffer;
@@ -38,6 +40,7 @@ namespace rpc {
 /// destroying them; afterwards the IO thread treats the call as
 /// abandoned and never dereferences those pointers again.
 class RpcChannel : public google::protobuf::RpcChannel,
+                   public std::enable_shared_from_this<RpcChannel>,
                    noncopyable {
 public:
     explicit RpcChannel(const std::shared_ptr<TcpConnection>& conn);
@@ -56,6 +59,12 @@ public:
         google::protobuf::Message* response = nullptr;
         google::protobuf::RpcController* controller = nullptr;
         google::protobuf::Closure* done = nullptr;
+        // Per-call deadline bookkeeping. Only the connection's IO thread
+        // touches these: the timer is armed when the request is
+        // registered and cancelled on every completion path, all of
+        // which run on the IO thread.
+        TimerId deadline;
+        bool deadlineArmed = false;
     };
     using CallSlotPtr = std::shared_ptr<CallSlot>;
 
@@ -71,13 +80,28 @@ public:
     /// String-keyed entry point used by RpcClient::syncCall; also handy
     /// for hand-rolled callers without a generated stub. Returns a
     /// handle that can be passed to cancelRequest() if the caller stops
-    /// waiting.
+    /// waiting. `timeoutMs > 0` arms an IO-thread deadline timer that
+    /// fails the call with kTimeout ("timeout") even if the caller is
+    /// not waiting on it (async/stub callers); `timeoutMs <= 0` means no
+    /// deadline.
     CallSlotPtr sendRequest(const std::string& serviceName,
                             const std::string& methodName,
                             const std::string& serializedArgs,
                             google::protobuf::Message* response,
                             google::protobuf::RpcController* controller,
-                            google::protobuf::Closure* done);
+                            google::protobuf::Closure* done,
+                            int timeoutMs = 0);
+
+    /// Deadline applied to stub-driven (CallMethod) calls, which have no
+    /// explicit timeout parameter. 0 disables deadlines (Phase 1
+    /// behaviour). Read on any thread; set before traffic starts.
+    void setDefaultTimeoutMs(int ms) { defaultTimeoutMs_ = ms; }
+
+    /// Observer invoked on the IO thread for every HEARTBEAT frame
+    /// received (pong). RpcClient wires this for dead-peer detection.
+    void setOnHeartbeat(std::function<void()> cb) {
+        onHeartbeat_ = std::move(cb);
+    }
 
     /// Called by a caller that stopped waiting (timeout). Detaches the
     /// caller-owned pointers under the slot lock, so any in-flight
@@ -97,12 +121,30 @@ private:
     void sendRequestInLoop(const CallSlotPtr& slot,
                            const std::string& serviceName,
                            const std::string& methodName,
-                           const std::string& serializedArgs);
+                           const std::string& serializedArgs,
+                           int timeoutMs);
 
+    /// Deadline timer body (IO thread): fails the call with kTimeout if
+    /// it is still pending.
+    void onDeadline(const CallSlotPtr& slot);
+
+    /// Thread-safe snapshot of the connection reference. sendRequest /
+    /// cancelRequest may run on caller threads while onDisconnect (IO
+    /// thread) releases the reference; every use therefore copies it out
+    /// under the mutex instead of dereferencing conn_ directly.
+    std::shared_ptr<TcpConnection> snapshotConn() const;
+
+    /// Complete a pending/brand-new call with an error and invoke done
+    /// exactly once. Caller must not hold slot->mtx. Any thread.
+    void failSlot(const CallSlotPtr& slot, const std::string& reason);
+
+    mutable std::mutex connMtx_;
     std::shared_ptr<TcpConnection> conn_;
     std::atomic<uint32_t> nextId_{1};  // 0 is never used
     // Only touched on the connection's IO thread.
     std::unordered_map<uint32_t, CallSlotPtr> pending_;
+    int defaultTimeoutMs_ = 0;
+    std::function<void()> onHeartbeat_;
 };
 
 }  // namespace rpc

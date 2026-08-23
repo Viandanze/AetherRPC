@@ -32,6 +32,10 @@ TcpConnection::~TcpConnection() {}
 
 void TcpConnection::connectEstablished() {
     setState(kConnected);
+    // Tie the Channel to this connection: handleEvent() then keeps `this`
+    // alive (via shared_ptr) while dispatching, even if a prior channel in
+    // the same epoll batch tears this connection down mid-loop.
+    channel_->tie(shared_from_this());
     channel_->enableReading();
     if (connectionCallback_) connectionCallback_(shared_from_this());
 }
@@ -234,6 +238,7 @@ void TcpConnection::handleRead() {
     // ET mode must read in a loop until EAGAIN
     int savedErrno = 0;
     ssize_t n = inputBuf_.readFd(channel_->fd(), &savedErrno);
+    bool gotData = n > 0;
 
     while (n > 0) {
         if (messageCallback_) {
@@ -241,6 +246,13 @@ void TcpConnection::handleRead() {
         }
         // keep reading; in ET mode there may be more data
         n = inputBuf_.readFd(channel_->fd(), &savedErrno);
+    }
+
+    if (gotData) {
+        // Inbound traffic refreshes the idle timer (server-side idle
+        // timeout); no-op when this loop has no TimerWheel. Runs on the
+        // connection's own IO thread, as TimerWheel requires.
+        loop_->insertToWheel(shared_from_this());
     }
 
     if (n == 0) {

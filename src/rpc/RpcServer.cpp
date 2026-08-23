@@ -21,7 +21,13 @@ RpcServer::RpcServer(EventLoop* loop, const InetAddress& listenAddr,
         });
 }
 
-void RpcServer::start() { server_.start(); }
+void RpcServer::start() {
+    if (workerThreads_ > 0) {
+        workers_ = std::make_unique<base::ThreadPool>("rpc-workers");
+        workers_->start(workerThreads_);
+    }
+    server_.start();
+}
 
 void RpcServer::registerService(google::protobuf::Service* service) {
     const google::protobuf::ServiceDescriptor* desc = service->GetDescriptor();
@@ -43,6 +49,16 @@ void RpcServer::onMessage(const std::shared_ptr<TcpConnection>& conn,
                 conn->forceClose();
             }
             return;  // wait for more bytes (half package)
+        }
+        if (header.msgType == kHeartbeat) {
+            // Keepalive: echo the frame back (pong). The inbound frame
+            // already refreshed the server-side idle timer in
+            // TcpConnection::handleRead.
+            std::string pong;
+            RpcCodec::appendFrame(&pong, kHeartbeat, header.requestId,
+                                  std::string());
+            conn->send(pong);
+            continue;
         }
         if (header.msgType != kRequest) {
             LOG_WARN("RpcServer: unexpected msgType %u from %s, closing",
@@ -90,14 +106,27 @@ void RpcServer::handleRequest(const std::shared_ptr<TcpConnection>& conn,
         return;
     }
 
-    // Runs inline on the IO thread (Phase 1). The done-callback owns
-    // `response` and deletes it after serialization.
+    // The done-callback owns `response` and deletes it after
+    // serialization. Handlers must run done before returning
+    // (synchronous-handler contract).
     google::protobuf::Closure* done = new FunctionClosure(
         [this, conn, requestId, response]() {
             onCallDone(conn, requestId, response);
         });
-    service->CallMethod(method, nullptr, request, response, done);
-    delete request;
+    if (workers_) {
+        // Business-thread pool: the handler (and `request`) leave the IO
+        // thread. conn->send() inside onCallDone is thread-safe (it hops
+        // back to the connection's IO loop), so slow handlers no longer
+        // block other calls multiplexed on the same connection.
+        workers_->run([service, method, request, response, done]() {
+            service->CallMethod(method, nullptr, request, response, done);
+            delete request;
+        });
+    } else {
+        // Runs inline on the IO thread (Phase 1 semantics).
+        service->CallMethod(method, nullptr, request, response, done);
+        delete request;
+    }
 }
 
 void RpcServer::onCallDone(const std::shared_ptr<TcpConnection>& conn,

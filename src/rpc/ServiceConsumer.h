@@ -57,6 +57,12 @@ public:
     ServiceConsumer& operator=(const ServiceConsumer&) = delete;
 
     /// Synchronous call against any live endpoint of `service`.
+    ///
+    /// `timeoutMs` is a TOTAL budget covering connect + call across ALL
+    /// failover attempts: the caller gets an answer (or a "timeout") no
+    /// later than roughly `timeoutMs` after the call started, instead of
+    /// kMaxAttempts x timeoutMs. Each attempt (including its connect)
+    /// draws from the remaining budget; retries stop once it runs dry.
     bool syncCall(const std::string& service, const std::string& method,
                   const google::protobuf::Message& request,
                   google::protobuf::Message* response,
@@ -69,10 +75,14 @@ public:
 
 private:
     static constexpr int kMaxAttempts = 3;
+    /// Connect draws from the remaining budget but never more than this
+    /// (a dead endpoint must not eat the whole budget before failover).
+    static constexpr int kConnectBudgetMs = 1000;
 
     /// Get-or-create the cached RpcClient for "host:port"; nullptr on
     /// connect failure (the failed entry is evicted).
-    std::shared_ptr<RpcClient> connectionFor(const std::string& addr);
+    std::shared_ptr<RpcClient> connectionFor(const std::string& addr,
+                                             int connectTimeoutMs);
     void dropConnection(const std::string& addr);
 
     EventLoop* loop_;

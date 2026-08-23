@@ -24,7 +24,12 @@ public:
 
     void listen();
     bool listening() const { return listening_; }
-    void stopListening();  // stop listening (for graceful shutdown)
+
+    /// Stop listening and CLOSE the listening socket (for graceful
+    /// shutdown): new connects fail fast with ECONNREFUSED instead of
+    /// completing the handshake into an accept backlog nobody drains.
+    /// Re-listening after this is not supported.
+    void stopListening();
 
 private:
     void handleRead();

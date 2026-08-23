@@ -8,11 +8,29 @@
 #include "net/TcpConnection.h"
 #include "net/EventLoop.h"
 #include "rpc/RpcCodec.h"
+#include "rpc/RpcController.h"
 #include "rpc/RpcProtocol.h"
 #include "rpc_common.pb.h"
 
 namespace aether {
 namespace rpc {
+
+namespace {
+
+/// Fail a controller with the timeout code. Controllers may be the
+/// framework's own RpcController (code-carrying overload) or a foreign
+/// implementation (fall back to the plain virtual).
+void failWithTimeout(google::protobuf::RpcController* controller) {
+    if (controller == nullptr) return;
+    if (auto* ours =
+            dynamic_cast<aether::rpc::RpcController*>(controller)) {
+        ours->SetFailed(aether::rpc::kTimeout, "timeout");
+    } else {
+        controller->SetFailed("timeout");
+    }
+}
+
+}  // namespace
 
 RpcChannel::RpcChannel(const std::shared_ptr<TcpConnection>& conn)
     : conn_(conn) {}
@@ -39,14 +57,14 @@ void RpcChannel::CallMethod(
         return;
     }
     sendRequest(method->service()->name(), method->name(), args, response,
-                controller, done);
+                controller, done, defaultTimeoutMs_);
 }
 
 RpcChannel::CallSlotPtr RpcChannel::sendRequest(
     const std::string& serviceName, const std::string& methodName,
     const std::string& serializedArgs, google::protobuf::Message* response,
     google::protobuf::RpcController* controller,
-    google::protobuf::Closure* done) {
+    google::protobuf::Closure* done, int timeoutMs) {
     uint32_t id = nextId_.fetch_add(1);
     if (id == 0) id = nextId_.fetch_add(1);  // skip the 0 sentinel on wrap
 
@@ -55,13 +73,27 @@ RpcChannel::CallSlotPtr RpcChannel::sendRequest(
     slot->controller = controller;
     slot->done = done;
 
+    // Snapshot the connection under the mutex: onDisconnect may release
+    // it concurrently on the IO thread. No connection (or a connection
+    // without a loop) means the channel is detached - fail the call
+    // synchronously instead of queueing onto a dead loop.
+    std::shared_ptr<TcpConnection> conn = snapshotConn();
+    if (conn == nullptr || conn->getLoop() == nullptr) {
+        failSlot(slot, "connection closed");
+        return slot;
+    }
+
     // Register the pending entry and write the frame on the IO thread so
     // pending_ stays single-threaded. Capture the slot by value: it owns
     // the call context, and its lock guards the raw pointers inside once
     // published (the publish itself is ordered by the functor queue).
-    conn_->getLoop()->runInLoop(
-        [this, slot, serviceName, methodName, serializedArgs]() {
-            sendRequestInLoop(slot, serviceName, methodName, serializedArgs);
+    // The channel is captured by shared_ptr so queued work cannot
+    // outlive a channel being replaced by a reconnect.
+    conn->getLoop()->runInLoop(
+        [self = shared_from_this(), slot, serviceName, methodName,
+         serializedArgs, timeoutMs]() {
+            self->sendRequestInLoop(slot, serviceName, methodName,
+                                    serializedArgs, timeoutMs);
         });
     return slot;
 }
@@ -83,20 +115,41 @@ void RpcChannel::cancelRequest(const CallSlotPtr& slot) {
     }
     if (done != nullptr) done->Run();  // releases the abandoned promise
 
-    // Hygiene: drop the map entry on the IO thread so abandoned entries
-    // do not accumulate while the connection stays healthy. Bounded risk:
-    // only the IO thread reads pending_, so a dead loop can never touch
-    // the entry either - it dies with the channel.
-    if (conn_ != nullptr && conn_->getLoop() != nullptr) {
-        conn_->getLoop()->queueInLoop(
-            [this, slot] { pending_.erase(slot->id); });
+    // Hygiene: drop the map entry (and any armed deadline timer) on the
+    // IO thread so abandoned entries do not accumulate while the
+    // connection stays healthy. Bounded risk: only the IO thread reads
+    // pending_, so a dead loop can never touch the entry either - it
+    // dies with the channel.
+    std::shared_ptr<TcpConnection> conn = snapshotConn();
+    if (conn != nullptr && conn->getLoop() != nullptr) {
+        conn->getLoop()->queueInLoop(
+            [self = shared_from_this(), slot]() {
+                if (slot->deadlineArmed) {
+                    std::shared_ptr<TcpConnection> c = self->snapshotConn();
+                    if (c != nullptr && c->getLoop() != nullptr) {
+                        c->getLoop()->cancel(slot->deadline);
+                        slot->deadlineArmed = false;
+                    }
+                }
+                self->pending_.erase(slot->id);
+            });
     }
 }
 
 void RpcChannel::sendRequestInLoop(const CallSlotPtr& slot,
                                    const std::string& serviceName,
                                    const std::string& methodName,
-                                   const std::string& serializedArgs) {
+                                   const std::string& serializedArgs,
+                                   int timeoutMs) {
+    // The connection may have dropped between the caller-thread
+    // sendRequest() and this functor running on the IO thread. Fail the
+    // call instead of writing into a dead socket.
+    std::shared_ptr<TcpConnection> conn = snapshotConn();
+    if (conn == nullptr || !conn->connected()) {
+        failSlot(slot, "connection closed");
+        return;
+    }
+
     RpcRequest req;
     req.set_service_name(serviceName);
     req.set_method_name(methodName);
@@ -108,7 +161,41 @@ void RpcChannel::sendRequestInLoop(const CallSlotPtr& slot,
     RpcCodec::appendFrame(&frame, kRequest, slot->id, body);
 
     pending_[slot->id] = slot;
-    conn_->send(frame);
+    conn->send(frame);
+
+    // Arm the per-call deadline after registration. Everything here runs
+    // on the IO thread, so the timer can never race the registration.
+    if (timeoutMs > 0) {
+        slot->deadline = conn->getLoop()->runAfter(
+            timeoutMs / 1000.0,
+            [self = shared_from_this(), slot]() { self->onDeadline(slot); });
+        slot->deadlineArmed = true;
+    }
+}
+
+void RpcChannel::onDeadline(const CallSlotPtr& slot) {
+    // IO thread. A call that already completed (reply arrived, caller
+    // cancelled, connection dropped) is no longer in pending_.
+    auto it = pending_.find(slot->id);
+    if (it == pending_.end()) return;
+    pending_.erase(it);
+    slot->deadlineArmed = false;  // this timer just fired
+
+    google::protobuf::Closure* done = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(slot->mtx);
+        done = slot->done;
+        slot->done = nullptr;
+        if (slot->response != nullptr) {  // caller still waiting
+            failWithTimeout(slot->controller);
+            slot->response = nullptr;
+            slot->controller = nullptr;
+        }
+        // response == nullptr: the caller gave up first (cancelRequest);
+        // its done was already run there - nothing to do.
+    }
+    // Run user code outside the lock.
+    if (done != nullptr) done->Run();
 }
 
 void RpcChannel::onMessage(Buffer* buf) {
@@ -118,6 +205,12 @@ void RpcChannel::onMessage(Buffer* buf) {
         bool err = false;
         if (!RpcCodec::tryParse(buf, &header, &body, &err)) {
             return;  // wait for more bytes (half package)
+        }
+        if (header.msgType == kHeartbeat) {
+            // Pong: no pending call to complete; notify the observer
+            // (RpcClient's dead-peer detection resets its miss counter).
+            if (onHeartbeat_) onHeartbeat_();
+            continue;
         }
         if (header.msgType != kResponse) {
             LOG_WARN("RpcChannel: unexpected msgType %u, ignoring",
@@ -141,6 +234,16 @@ void RpcChannel::onMessage(Buffer* buf) {
         }
         CallSlotPtr slot = it->second;
         pending_.erase(it);
+        if (slot->deadlineArmed) {
+            // The reply won the race against the deadline timer; cancel
+            // it so it does not fire on a completed call. Both this code
+            // and the timer run on the IO thread, so no race.
+            std::shared_ptr<TcpConnection> conn = snapshotConn();
+            if (conn != nullptr && conn->getLoop() != nullptr) {
+                conn->getLoop()->cancel(slot->deadline);
+            }
+            slot->deadlineArmed = false;
+        }
 
         google::protobuf::Closure* done = nullptr;
         {
@@ -178,24 +281,55 @@ void RpcChannel::onMessage(Buffer* buf) {
 }
 
 void RpcChannel::onDisconnect() {
+    std::shared_ptr<TcpConnection> conn = snapshotConn();
+    // Cancel any armed deadline timers first: the slots below are failed
+    // right here, so a later timer firing would find nothing in pending_
+    // (harmless) but would also keep the slot alive a bit longer.
     for (auto& kv : pending_) {
         const CallSlotPtr& slot = kv.second;
-        google::protobuf::Closure* done = nullptr;
-        {
-            std::lock_guard<std::mutex> guard(slot->mtx);
-            done = slot->done;
-            slot->done = nullptr;
-            if (slot->response != nullptr) {  // not abandoned
-                if (slot->controller != nullptr) {
-                    slot->controller->SetFailed("connection closed");
-                }
-                slot->response = nullptr;
-                slot->controller = nullptr;
-            }
+        if (slot->deadlineArmed && conn != nullptr &&
+            conn->getLoop() != nullptr) {
+            conn->getLoop()->cancel(slot->deadline);
+            slot->deadlineArmed = false;
         }
-        if (done != nullptr) done->Run();
+    }
+    for (auto& kv : pending_) {
+        failSlot(kv.second, "connection closed");
     }
     pending_.clear();
+
+    // Release the connection reference. Until this reset the channel
+    // kept the TcpConnection (and therefore its socket fd) alive even
+    // after a close - the fd only closed when the RpcClient itself was
+    // destroyed, which on the server side looks like a connection that
+    // never goes away (idle reaped connections were never removed).
+    {
+        std::lock_guard<std::mutex> guard(connMtx_);
+        conn_.reset();
+    }
+}
+
+std::shared_ptr<TcpConnection> RpcChannel::snapshotConn() const {
+    std::lock_guard<std::mutex> guard(connMtx_);
+    return conn_;
+}
+
+void RpcChannel::failSlot(const CallSlotPtr& slot, const std::string& reason) {
+    google::protobuf::Closure* done = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(slot->mtx);
+        done = slot->done;
+        slot->done = nullptr;
+        if (slot->response != nullptr) {  // not abandoned
+            if (slot->controller != nullptr) {
+                slot->controller->SetFailed(reason);
+            }
+            slot->response = nullptr;
+            slot->controller = nullptr;
+        }
+    }
+    // Run user code outside the lock.
+    if (done != nullptr) done->Run();
 }
 
 }  // namespace rpc
