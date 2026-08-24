@@ -84,3 +84,18 @@ target_link_libraries(dist_echo_client PRIVATE aetherrpc)
 # ---------------------------------------------------------------------------
 enable_testing()
 add_subdirectory(test)
+
+# ---------------------------------------------------------------------------
+# optional benchmark suite (AetherRPC vs gRPC); skipped silently when no
+# gRPC dev installation is present - the library and tests never need it
+# ---------------------------------------------------------------------------
+find_path(GRPCPP_INCLUDE_DIR grpcpp/grpcpp.h)
+find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
+find_library(GRPCPP_LIB grpc++)
+find_library(GRPC_LIB grpc)
+if(GRPCPP_INCLUDE_DIR AND GRPC_CPP_PLUGIN_EXECUTABLE AND GRPCPP_LIB AND GRPC_LIB)
+    message(STATUS "gRPC found: benchmark suite enabled")
+    add_subdirectory(bench)
+else()
+    message(STATUS "gRPC not found: benchmark suite skipped")
+endif()

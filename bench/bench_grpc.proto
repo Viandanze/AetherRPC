@@ -1,0 +1,15 @@
+// gRPC counterpart of proto/bench.proto. Identical wire format; kept
+// separate because the gRPC codegen plugin refuses protos with
+// cc_generic_services = true (which AetherRPC's reflection-based
+// dispatch needs).
+syntax = "proto3";
+
+package aether.bench;
+
+message PayloadG {
+    bytes data = 1;
+}
+
+service BenchG {
+    rpc Echo(PayloadG) returns (PayloadG);
+}

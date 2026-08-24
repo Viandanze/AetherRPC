@@ -197,6 +197,37 @@ Runnable versions: `examples/dist_echo_server.cpp`,
 ./dist_echo_client 12 127.0.0.1:2181
 ```
 
+## Benchmarks
+
+Unary echo, same machine (loopback), one connection/channel per worker
+thread, 200 untimed warmup calls per thread, median of 3 runs.
+`bench_rpc <aether|grpc> <payload-bytes> <threads> <calls-per-thread>`
+compares AetherRPC against gRPC 1.30 (synchronous unary API, default
+server thread pool) with the same bytes-echo payload.
+
+| Payload | Threads | AetherRPC QPS | gRPC QPS | AetherRPC p50 | gRPC p50 |
+|---------|---------|---------------|----------|---------------|----------|
+| 64 B    | 1       | 62.5k         | 39.1k    | 14.8 µs       | 21.1 µs  |
+| 1 KiB   | 1       | 59.5k         | 37.9k    | 15.3 µs       | 22.1 µs  |
+| 16 KiB  | 1       | 26.6k         | 30.9k    | 33.3 µs       | 26.5 µs  |
+| 64 B    | 8       | 72.4k         | 29.2k    | —             | —        |
+| 1 KiB   | 8       | 69.3k         | 29.6k    | —             | —        |
+| 16 KiB  | 8       | 31.6k         | 22.7k    | —             | —        |
+
+Numbers are from a CPU-throttled cloud sandbox (release build,
+`-O2`); treat them as a same-machine relative comparison, not absolute
+hardware performance. gRPC's HTTP/2 framing costs show up at small
+payloads, where AetherRPC's length-prefixed protobuf frames win ~35%
+on latency and ~2.5x on throughput; at 16 KiB gRPC's tuned write path
+pulls ahead on single-connection latency. The benchmark binary builds
+automatically when a gRPC development installation is detected and is
+otherwise skipped:
+
+```bash
+./bench/bench_rpc aether 64 8 2000
+./bench/bench_rpc grpc   64 8 2000
+```
+
 ## Roadmap
 
 - [x] Phase 1 — single-node RPC: custom protocol, protobuf dispatch,
@@ -205,14 +236,14 @@ Runnable versions: `examples/dist_echo_server.cpp`,
       nodes + watchers), client-side discovery cache, round-robin /
       random load balancing, per-endpoint connection cache, failover
       retries, distributed e2e tests with ASan
-- [ ] Phase 3 — production hardening (in progress):
+- [x] Phase 3 — production hardening:
   - [x] Per-call deadlines with a shared retry budget
   - [x] Connection keepalive + dead-peer detection (ping/pong, miss
         counting), server-side idle-connection reaping (timing wheel)
   - [x] Business-thread pool: slow service handlers run off the IO loop
-  - [x] Connection pooling (per-endpoint pool with failover)
   - [x] Non-blocking connector with automatic reconnect
-  - [ ] Benchmarks vs gRPC
+  - [x] Connection pooling (per-endpoint pool with failover)
+  - [x] Benchmarks vs gRPC
 
 ## License
 

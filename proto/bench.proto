@@ -1,0 +1,17 @@
+// Benchmark payload shared by the AetherRPC and gRPC harnesses in
+// bench/. Generic services give AetherRPC its Service/Stub pair;
+// the gRPC plugin generates the gRPC stub from the same definition.
+syntax = "proto3";
+
+package aether.bench;
+
+option cc_generic_services = true;
+
+message Payload {
+    bytes data = 1;
+}
+
+service Bench {
+    // Unary echo: the server returns the request payload unchanged.
+    rpc Echo(Payload) returns (Payload);
+}
