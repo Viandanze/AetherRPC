@@ -1,6 +1,7 @@
 // Phase 3 end-to-end tests: per-call deadlines (sync + async stub),
-// heartbeat keepalive vs server idle timeout, dead-peer detection, and
-// the business-thread pool.
+// heartbeat keepalive vs server idle timeout, dead-peer detection, the
+// business-thread pool, and the non-blocking connector with automatic
+// reconnect.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -36,6 +37,7 @@ const uint16_t kPortKeepalive  = 18933;
 const uint16_t kPortIdle       = 18934;
 const uint16_t kPortDeadPeer   = 18935;
 const uint16_t kPortWorkers    = 18936;
+const uint16_t kPortReconnect  = 18937;
 
 class FunctionClosure : public google::protobuf::Closure {
 public:
@@ -310,6 +312,80 @@ void test_worker_pool_concurrency() {
     ASSERT_TRUE(elapsed < 1500);
 }
 
+void test_connector_reconnect() {
+    TEST_SUITE("Connector: auto-reconnect after server restart");
+
+    EchoServiceImpl echo;
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortReconnect), "reconnect-server-1");
+    server->registerService(&echo);
+    serverLoop->runInLoop([&] { server->start(); });
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+    RpcClient client(clientLoop, InetAddress("127.0.0.1", kPortReconnect));
+    client.enableRetry();
+    ASSERT_TRUE(connectWithRetry(&client));
+
+    example::EchoRequest req;
+    req.set_message("round-one");
+    example::EchoResponse resp;
+    std::string error;
+    ASSERT_TRUE(client.syncCall("EchoService", "Echo", req, &resp, 2000,
+                                &error));
+    ASSERT_STREQ(resp.message(), "round-one");
+
+    // Kill the server. stop()+destroy must run ON the server loop (the
+    // documented teardown contract): destroying a TcpServer with live
+    // connections from another thread races the loop's close callbacks.
+    // This mirrors a real server process dying.
+    std::promise<void> dead;
+    serverLoop->runInLoop([&] {
+        server->stop();
+        server.reset();
+        dead.set_value();
+    });
+    dead.get_future().wait();
+    ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 3000));
+
+    // While disconnected, calls fail fast instead of hanging.
+    ASSERT_FALSE(client.syncCall("EchoService", "Echo", req, &resp, 2000,
+                                 &error));
+    ASSERT_CONTAINS(error, "not connected");
+
+    // Bring a fresh server up on the same port. The client reconnects
+    // on its own (exponential backoff) and calls work again through the
+    // SAME channel/stub pointer - no re-bind needed on the caller side.
+    auto server2 = std::make_unique<RpcServer>(
+        serverLoop, InetAddress(kPortReconnect), "reconnect-server-2");
+    server2->registerService(&echo);
+    serverLoop->runInLoop([&] { server2->start(); });
+
+    ASSERT_TRUE(waitFor([&] { return client.connected(); }, 15000));
+
+    req.set_message("round-two");
+    resp.Clear();
+    error.clear();
+    ASSERT_TRUE(client.syncCall("EchoService", "Echo", req, &resp, 3000,
+                                &error));
+    ASSERT_STREQ(resp.message(), "round-two");
+    ASSERT_EQ(server2->connectionCount(), 1);
+
+    // Explicit teardown of server2, same contract as above; the client
+    // notices the drop and starts retrying (the client destructor stops
+    // the retry loop).
+    std::promise<void> dead2;
+    serverLoop->runInLoop([&] {
+        server2->stop();
+        server2.reset();
+        dead2.set_value();
+    });
+    dead2.get_future().wait();
+    ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 3000));
+}
+
 int main() {
     test_sync_call_timeout();
     test_async_stub_timeout();
@@ -317,5 +393,6 @@ int main() {
     test_idle_timeout_without_heartbeat();
     test_dead_peer_detection();
     test_worker_pool_concurrency();
+    test_connector_reconnect();
     TEST_SUMMARY();
 }

@@ -32,8 +32,15 @@ void failWithTimeout(google::protobuf::RpcController* controller) {
 
 }  // namespace
 
+RpcChannel::RpcChannel() = default;
+
 RpcChannel::RpcChannel(const std::shared_ptr<TcpConnection>& conn)
     : conn_(conn) {}
+
+void RpcChannel::attachConnection(const std::shared_ptr<TcpConnection>& conn) {
+    std::lock_guard<std::mutex> guard(connMtx_);
+    conn_ = conn;
+}
 
 RpcChannel::~RpcChannel() {
     // Do not touch slot pointers here: callers that abandoned their

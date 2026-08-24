@@ -87,6 +87,12 @@ packages and sticky packages via length-prefix framing.
   responsive
 - **Aether-grade transport** — multi-reactor with IO thread pool,
   non-blocking IO, TCP_NODELAY, idle timeouts, graceful shutdown
+- **Non-blocking connector with auto-reconnect** — `Connector` drives
+  connect attempts with a state machine (non-blocking connect +
+  epoll write-ready), optional exponential-backoff retry
+  (`RpcClient::enableRetry()`, 500ms growing to 30s cap). On transport
+  failure the connection re-establishes itself; pending stubs survive
+  because `RpcChannel` re-binds to the fresh connection
 
 ## Build
 
@@ -98,7 +104,7 @@ tests and examples.
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
-ctest            # 7 suites: net regression + codec + rpc e2e + LB + zk
+ctest            # 8 suites: net regression + codec + rpc e2e + LB + zk + phase3
 ```
 
 ## Quick start
@@ -200,7 +206,7 @@ Runnable versions: `examples/dist_echo_server.cpp`,
         counting), server-side idle-connection reaping (timing wheel)
   - [x] Business-thread pool: slow service handlers run off the IO loop
   - [ ] Connection pooling (per-endpoint pool with failover)
-  - [ ] Non-blocking connector with automatic reconnect
+  - [x] Non-blocking connector with automatic reconnect
   - [ ] Benchmarks vs gRPC
 
 ## License

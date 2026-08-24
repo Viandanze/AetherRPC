@@ -43,8 +43,18 @@ class RpcChannel : public google::protobuf::RpcChannel,
                    public std::enable_shared_from_this<RpcChannel>,
                    noncopyable {
 public:
+    /// A channel starts unbound and attaches when the client connects
+    /// (and re-attaches on every reconnect): stubs capture the channel
+    /// pointer once and keep working across reconnects.
+    RpcChannel();
     explicit RpcChannel(const std::shared_ptr<TcpConnection>& conn);
     ~RpcChannel() override;
+
+    /// Bind (or re-bind) to a live connection. Called by RpcClient when
+    /// a connection is established, on the connection's IO thread; the
+    /// previous connection has fully closed by then (onDisconnect
+    /// released it and failed all pending calls).
+    void attachConnection(const std::shared_ptr<TcpConnection>& conn);
 
     /// Per-call bookkeeping shared between the calling thread and the
     /// connection's IO thread. `response` and `controller` are owned by
