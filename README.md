@@ -93,6 +93,11 @@ packages and sticky packages via length-prefix framing.
   (`RpcClient::enableRetry()`, 500ms growing to 30s cap). On transport
   failure the connection re-establishes itself; pending stubs survive
   because `RpcChannel` re-binds to the fresh connection
+- **Per-endpoint connection pools** — `ConnectionPool` keeps up to N
+  multiplexed connections per endpoint (RAII `Lease`, idle recycling,
+  slot reservation so the cap holds under concurrent acquires).
+  `ServiceConsumer` uses a pool per discovered endpoint; a failed call
+  drops just its connection while the pool's others stay warm
 
 ## Build
 
@@ -205,7 +210,7 @@ Runnable versions: `examples/dist_echo_server.cpp`,
   - [x] Connection keepalive + dead-peer detection (ping/pong, miss
         counting), server-side idle-connection reaping (timing wheel)
   - [x] Business-thread pool: slow service handlers run off the IO loop
-  - [ ] Connection pooling (per-endpoint pool with failover)
+  - [x] Connection pooling (per-endpoint pool with failover)
   - [x] Non-blocking connector with automatic reconnect
   - [ ] Benchmarks vs gRPC
 

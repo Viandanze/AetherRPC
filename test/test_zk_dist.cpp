@@ -288,6 +288,90 @@ void test_distributed_e2e_failover() {
     zk.shutdown();
 }
 
+/// Phase 3 pool test: concurrent callers through the per-endpoint
+/// connection pool, with a server dying MID-FLIGHT (ZK node lingering).
+/// Every call must still be answered - in-flight victims fail over to
+/// the survivor, and post-kill traffic moves entirely to it.
+void test_pool_failover() {
+    TEST_SUITE("Pool: concurrent callers survive a mid-flight kill");
+    ZkClient zk(zkAddr());
+    ASSERT_TRUE(zk.connect());
+    const std::string base = "/AetherRPC-test-pool-" +
+                             std::to_string(static_cast<long>(::getpid()));
+    cleanupTree(zk, base);
+
+    const uint16_t ports[2] = {19301, 19302};
+    std::vector<std::unique_ptr<ServerNode>> nodes;
+    for (int i = 0; i < 2; ++i)
+        nodes.emplace_back(std::make_unique<ServerNode>(&zk, base, ports[i]));
+    for (auto& n : nodes) n->start();
+
+    EventLoopThread clientLoopThread;
+    EventLoop* clientLoop = clientLoopThread.startLoop();
+    ServiceConsumer consumer(clientLoop, &zk,
+                             std::make_unique<RoundRobinLoadBalancer>(),
+                             base, /*poolSizePerEndpoint=*/2);
+
+    std::atomic<int> issued{0};
+    std::atomic<int> succeeded{0};
+    std::atomic<bool> stop{false};
+
+    // 8 concurrent callers, each looping until told to stop.
+    std::vector<std::thread> callers;
+    for (int t = 0; t < 8; ++t) {
+        callers.emplace_back([&, t] {
+            for (int i = 0; !stop.load(); ++i) {
+                ::aether::rpc::example::AddRequest req;
+                req.set_a(t);
+                req.set_b(1000 + i);
+                ::aether::rpc::example::AddResponse resp;
+                issued.fetch_add(1);
+                if (consumer.syncCall("MathService", "Add", req, &resp, 3000))
+                    succeeded.fetch_add(1);
+            }
+        });
+    }
+
+    // Kill node 0's RPC server mid-flight; its ZK registration stays
+    // (half-dead process). In-flight calls on its pooled connections
+    // get a transport error and fail over to node 1.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    nodes[0]->loop->runInLoop([&] { nodes[0]->server->stop(); });
+
+    // Let the failover storm play out, then stop the caller threads.
+    // Client-visible correctness: every issued call was answered
+    // (kill-victim calls included - their first attempt died, the
+    // retry landed on the survivor).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stop.store(true);
+    for (auto& t : callers) t.join();
+    ASSERT_EQ(succeeded.load(), issued.load());
+    ASSERT_TRUE(succeeded.load() > 0);
+
+    // Settle: node 0 is fully dead now. A fresh burst must keep
+    // working entirely through node 1 (half of the picks are node 0 -
+    // they fail over, node 0's handler is gone so it serves nothing).
+    const int aAfterKill = nodes[0]->math.count();
+    const int bBefore = nodes[1]->math.count();
+    int burstOk = 0;
+    for (int i = 0; i < 6; ++i) {
+        ::aether::rpc::example::AddRequest req;
+        req.set_a(i);
+        req.set_b(2000);
+        ::aether::rpc::example::AddResponse resp;
+        if (consumer.syncCall("MathService", "Add", req, &resp, 3000))
+            ++burstOk;
+    }
+
+    ASSERT_EQ(burstOk, 6);
+    ASSERT_EQ(nodes[0]->math.count(), aAfterKill);
+    ASSERT_EQ(nodes[1]->math.count() - bBefore, 6);
+
+    for (auto& n : nodes) n->stopServer();
+    cleanupTree(zk, base);
+    zk.shutdown();
+}
+
 int main() {
     if (!zkReachable()) {
         printf("── SKIP: no ZooKeeper at %s (set %s to override) ──\n",
@@ -296,5 +380,6 @@ int main() {
     }
     test_registry_and_discovery();
     test_distributed_e2e_failover();
+    test_pool_failover();
     TEST_SUMMARY();
 }

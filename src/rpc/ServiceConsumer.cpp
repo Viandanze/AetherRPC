@@ -31,21 +31,23 @@ std::vector<std::string> exclude(const std::vector<std::string>& eps,
 }  // namespace
 
 ServiceConsumer::ServiceConsumer(EventLoop* loop, zk::ZkClient* zk,
-                                 LoadBalancerPtr lb, std::string basePath)
+                                 LoadBalancerPtr lb, std::string basePath,
+                                 size_t poolSizePerEndpoint)
     : loop_(loop),
       zk_(zk),
       lb_(std::move(lb)),
-      discovery_(zk, std::move(basePath)) {}
+      discovery_(zk, std::move(basePath)),
+      poolSize_(poolSizePerEndpoint == 0 ? 1 : poolSizePerEndpoint) {}
 
 ServiceConsumer::~ServiceConsumer() {
-    // Evict connections while their IO loop is still alive. RpcClient's
-    // dtor performs a synchronous disconnect handshake with the loop.
-    std::map<std::string, std::shared_ptr<RpcClient>> conns;
+    // Destroy pools while their IO loop is still alive; ~ConnectionPool
+    // runs each pooled client's synchronous disconnect handshake.
+    std::map<std::string, std::unique_ptr<ConnectionPool>> pools;
     {
-        std::lock_guard<std::mutex> lock(connMtx_);
-        conns.swap(conns_);
+        std::lock_guard<std::mutex> lock(poolMtx_);
+        pools.swap(pools_);
     }
-    conns.clear();
+    pools.clear();
 }
 
 bool ServiceConsumer::syncCall(const std::string& service,
@@ -98,58 +100,42 @@ bool ServiceConsumer::syncCall(const std::string& service,
         if (addr.empty()) continue;
 
         int connectMs = bounded ? std::min(left, kConnectBudgetMs) : 0;
-        std::shared_ptr<RpcClient> client = connectionFor(addr, connectMs);
-        if (client == nullptr) {
+        ConnectionPool::Lease lease = poolFor(addr).acquire(connectMs);
+        if (!lease) {
             tried.insert(addr);
             continue;
         }
 
-        if (client->syncCall(service, method, request, response,
-                             remainingMs(), error)) {
-            return true;
+        if (lease->syncCall(service, method, request, response,
+                            remainingMs(), error)) {
+            return true;  // ~Lease recycles the healthy connection
         }
 
-        // Connection-level failure: evict and try another endpoint.
-        dropConnection(addr);
+        // Connection-level failure: drop this connection (not the whole
+        // pool - its other connections may be fine) and try another
+        // endpoint.
+        lease.markUnhealthy();
         tried.insert(addr);
     }
     if (error && error->empty()) *error = "all attempts failed";
     return false;
 }
 
-std::shared_ptr<RpcClient> ServiceConsumer::connectionFor(
-    const std::string& addr, int connectTimeoutMs) {
+ConnectionPool& ServiceConsumer::poolFor(const std::string& addr) {
     {
-        std::lock_guard<std::mutex> lock(connMtx_);
-        auto it = conns_.find(addr);
-        if (it != conns_.end() && it->second->connected()) return it->second;
+        std::lock_guard<std::mutex> lock(poolMtx_);
+        auto it = pools_.find(addr);
+        if (it != pools_.end()) return *it->second;
     }
-
-    InetAddress serverAddr = parseAddr(addr);
-    auto client = std::make_shared<RpcClient>(loop_, serverAddr,
-                                              "consumer-" + addr);
-    if (!client->connect(connectTimeoutMs)) return nullptr;
-
-    std::lock_guard<std::mutex> lock(connMtx_);
-    // First caller to connect wins; ours goes to the cache (and gets
-    // disconnected on destruction - acceptable for this phase).
-    auto it = conns_.find(addr);
-    if (it != conns_.end() && it->second->connected()) return it->second;
-    conns_[addr] = client;
-    return client;
-}
-
-void ServiceConsumer::dropConnection(const std::string& addr) {
-    std::shared_ptr<RpcClient> client;
-    {
-        std::lock_guard<std::mutex> lock(connMtx_);
-        auto it = conns_.find(addr);
-        if (it == conns_.end()) return;
-        client = it->second;
-        conns_.erase(it);
-    }
-    // RpcClient dtor runs the synchronous disconnect handshake outside
-    // connMtx_ (it waits on the IO loop thread).
+    auto pool = std::make_unique<ConnectionPool>(loop_, parseAddr(addr),
+                                                 "consumer", poolSize_);
+    ConnectionPool& ref = *pool;
+    std::lock_guard<std::mutex> lock(poolMtx_);
+    // First creator wins; the loser's pool (with no connections yet) is
+    // destroyed right away - its dtor is cheap with an empty idle set.
+    auto [it2, inserted] = pools_.try_emplace(addr, std::move(pool));
+    if (!inserted) return *it2->second;
+    return ref;
 }
 
 }  // namespace rpc

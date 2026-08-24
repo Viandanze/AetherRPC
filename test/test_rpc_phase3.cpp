@@ -1,7 +1,7 @@
 // Phase 3 end-to-end tests: per-call deadlines (sync + async stub),
 // heartbeat keepalive vs server idle timeout, dead-peer detection, the
-// business-thread pool, and the non-blocking connector with automatic
-// reconnect.
+// business-thread pool, the non-blocking connector with automatic
+// reconnect, and the per-endpoint connection pool.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -18,6 +18,7 @@
 #include "net/EventLoopThread.h"
 #include "net/InetAddress.h"
 #include "net/TcpServer.h"
+#include "rpc/ConnectionPool.h"
 #include "rpc/RpcChannel.h"
 #include "rpc/RpcClient.h"
 #include "rpc/RpcController.h"
@@ -38,6 +39,7 @@ const uint16_t kPortIdle       = 18934;
 const uint16_t kPortDeadPeer   = 18935;
 const uint16_t kPortWorkers    = 18936;
 const uint16_t kPortReconnect  = 18937;
+const uint16_t kPortPool       = 18938;
 
 class FunctionClosure : public google::protobuf::Closure {
 public:
@@ -89,6 +91,23 @@ bool waitFor(const std::function<bool()>& pred, int timeoutMs) {
     return pred();
 }
 
+/// Destroy `server` on its own loop and wait: the documented TcpServer
+/// destruction contract. A main-thread destruction races in-flight
+/// close callbacks (ASan-verified heap-use-after-free - the window is
+/// narrow, but real).
+void destroyServerOnLoop(EventLoop* loop,
+                         std::unique_ptr<RpcServer>& server) {
+    std::promise<void> gone;
+    loop->runInLoop([&] {
+        if (server) {
+            server->stop();
+            server.reset();
+        }
+        gone.set_value();
+    });
+    gone.get_future().wait();
+}
+
 /// Connect with retries (the server may still be binding its port).
 bool connectWithRetry(RpcClient* client) {
     for (int i = 0; i < 200; ++i) {
@@ -137,6 +156,8 @@ void test_sync_call_timeout() {
     ok = client.syncCall("EchoService", "Echo", req, &resp, 2000, &error);
     ASSERT_TRUE(ok);
     ASSERT_STREQ(resp.message(), "deadline");
+
+    destroyServerOnLoop(serverLoop, server);
 }
 
 void test_async_stub_timeout() {
@@ -180,6 +201,8 @@ void test_async_stub_timeout() {
     // guards the memory-safety half of this assertion.
     std::this_thread::sleep_for(500ms);
     ASSERT_STREQ(resp.message(), "");
+
+    destroyServerOnLoop(serverLoop, server);
 }
 
 void test_heartbeat_keeps_idle_connection_alive() {
@@ -212,6 +235,8 @@ void test_heartbeat_keeps_idle_connection_alive() {
                                 &error));
     ASSERT_STREQ(resp.message(), "still-alive");
     ASSERT_EQ(server->connectionCount(), 1);
+
+    destroyServerOnLoop(serverLoop, server);
 }
 
 void test_idle_timeout_without_heartbeat() {
@@ -242,6 +267,8 @@ void test_idle_timeout_without_heartbeat() {
     ASSERT_TRUE(waitFor([&] { return server->connectionCount() == 0; },
                         4000));
     ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 1000));
+
+    destroyServerOnLoop(serverLoop, server);
 }
 
 void test_dead_peer_detection() {
@@ -263,6 +290,15 @@ void test_dead_peer_detection() {
     // 200ms interval, 2 misses allowed: detection within ~0.6-1s.
     client.enableHeartbeat(0.2, 2);
     ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 2000));
+
+    // Teardown on the loop (same destruction contract, raw TcpServer).
+    std::promise<void> gone;
+    serverLoop->runInLoop([&] {
+        rawServer.stopAccepting();
+        rawServer.forceCloseAll();
+        gone.set_value();
+    });
+    gone.get_future().wait();
 }
 
 void test_worker_pool_concurrency() {
@@ -310,6 +346,8 @@ void test_worker_pool_concurrency() {
 
     ASSERT_EQ(okCount.load(), kCalls);
     ASSERT_TRUE(elapsed < 1500);
+
+    destroyServerOnLoop(serverLoop, server);
 }
 
 void test_connector_reconnect() {
@@ -386,6 +424,113 @@ void test_connector_reconnect() {
     ASSERT_TRUE(waitFor([&] { return !client.connected(); }, 3000));
 }
 
+void test_connection_pool() {
+    TEST_SUITE("Pool: bounded connections serve concurrent callers");
+    EchoServiceImpl echo;
+    EventLoopThread serverThread;
+    EventLoop* serverLoop = serverThread.startLoop();
+    auto server = std::make_unique<RpcServer>(serverLoop,
+                                              InetAddress(kPortPool),
+                                              "pool-server");
+    server->registerService(&echo);
+    serverLoop->runInLoop([&] { server->start(); });
+    ASSERT_TRUE(waitFor([&] { return server->listening(); }, 3000));
+
+    EventLoopThread clientThread;
+    EventLoop* clientLoop = clientThread.startLoop();
+
+    const size_t kMax = 2;
+    ConnectionPool pool(clientLoop, InetAddress("127.0.0.1", kPortPool),
+                        "pool-test", kMax);
+
+    // 6 caller threads x 5 calls each: the pool must serve all 30
+    // calls while never opening more than kMax connections to the
+    // endpoint (verified server-side).
+    const int kThreads = 6;
+    const int kCallsEach = 5;
+    std::atomic<int> okCount{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kCallsEach; ++i) {
+                ConnectionPool::Lease lease = pool.acquire(2000);
+                if (!lease) continue;
+                example::EchoRequest req;
+                req.set_message("pool-" + std::to_string(t) + "-" +
+                                std::to_string(i));
+                example::EchoResponse resp;
+                if (lease->syncCall("EchoService", "Echo", req, &resp, 2000)) {
+                    if (resp.message() == req.message()) okCount.fetch_add(1);
+                } else {
+                    lease.markUnhealthy();
+                }
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    ASSERT_EQ(okCount.load(), kThreads * kCallsEach);
+    // Cap enforced: the server never saw more than kMax live
+    // connections, and by now all leases are back idle.
+    ASSERT_TRUE(server->connectionCount() <= static_cast<int>(kMax));
+    ASSERT_EQ(server->connectionCount(), static_cast<int>(kMax));
+    ASSERT_EQ(pool.liveCount(), kMax);
+    ASSERT_EQ(pool.idleCount(), kMax);
+
+    // Connections are RECYCLED: reuse the idle set for a sequential
+    // burst - no new connections should appear server-side.
+    for (int i = 0; i < 8; ++i) {
+        ConnectionPool::Lease lease = pool.acquire(2000);
+        ASSERT_TRUE(static_cast<bool>(lease));
+        example::EchoRequest req;
+        req.set_message("recycle");
+        example::EchoResponse resp;
+        ASSERT_TRUE(lease->syncCall("EchoService", "Echo", req, &resp, 2000));
+    }
+    ASSERT_EQ(server->connectionCount(), static_cast<int>(kMax));
+    ASSERT_EQ(pool.liveCount(), kMax);
+
+    TEST_SUITE("Pool: unhealthy lease is dropped, not recycled");
+    // A killed connection returned as unhealthy must be discarded; the
+    // next acquire transparently dials a fresh one.
+    ConnectionPool::Lease lease = pool.acquire(2000);
+    ASSERT_TRUE(static_cast<bool>(lease));
+    lease.markUnhealthy();
+    lease = ConnectionPool::Lease();  // release the broken connection
+
+    ConnectionPool::Lease fresh = pool.acquire(2000);
+    ASSERT_TRUE(static_cast<bool>(fresh));
+    example::EchoRequest req;
+    req.set_message("fresh");
+    example::EchoResponse resp;
+    ASSERT_TRUE(fresh->syncCall("EchoService", "Echo", req, &resp, 2000));
+    ASSERT_STREQ(resp.message(), "fresh");
+    // We dropped the broken one and are holding the survivor: live is
+    // idle(0) + this lease(1).
+    ASSERT_EQ(pool.liveCount(), 1u);
+
+    // Releasing the healthy lease and acquiring again refills to cap
+    // as demand rises: first acquire recycles the idle connection,
+    // second (idle empty, below cap) dials a fresh one.
+    fresh = ConnectionPool::Lease();
+    ConnectionPool::Lease l1 = pool.acquire(2000);
+    ConnectionPool::Lease l2 = pool.acquire(2000);
+    ASSERT_TRUE(static_cast<bool>(l1));
+    ASSERT_TRUE(static_cast<bool>(l2));
+    ASSERT_EQ(pool.liveCount(), kMax);
+
+    TEST_SUITE("Pool: connect failure surfaces as an empty lease");
+    ConnectionPool deadPool(clientLoop, InetAddress("127.0.0.1", kPortPool + 1),
+                            "pool-dead", kMax);
+    ConnectionPool::Lease none = deadPool.acquire(500);
+    ASSERT_FALSE(static_cast<bool>(none));
+    ASSERT_EQ(deadPool.liveCount(), 0u);
+
+    // Teardown on the server loop (destruction contract); the pools
+    // die at scope exit while their IO loop still lives.
+    destroyServerOnLoop(serverLoop, server);
+}
+
 int main() {
     test_sync_call_timeout();
     test_async_stub_timeout();
@@ -394,5 +539,6 @@ int main() {
     test_dead_peer_detection();
     test_worker_pool_concurrency();
     test_connector_reconnect();
+    test_connection_pool();
     TEST_SUMMARY();
 }

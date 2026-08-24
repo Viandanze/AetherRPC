@@ -7,10 +7,12 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <google/protobuf/message.h>
 
 #include "base/noncopyable.h"
+#include "rpc/ConnectionPool.h"
 #include "rpc/LoadBalancer.h"
 #include "rpc/ServiceDiscovery.h"
 #include "zk/ZkClient.h"
@@ -27,16 +29,18 @@ class RpcClient;
 ///
 ///   ServiceDiscovery   - which servers exist (live updated via ZK)
 ///   LoadBalancer       - which server to try next
-///   connection cache   - one RpcClient per endpoint; a connection is
-///                        kept and multiplexed across calls (Phase 1
-///                        channel semantics)
+///   connection pools   - a bounded ConnectionPool per endpoint
+///                        (Phase 3): concurrent callers spread over up
+///                        to `poolSizePerEndpoint` multiplexed
+///                        connections; idle ones are recycled
 ///
 /// Call flow of syncCall():
-///   endpoints -> LB pick -> cached (or new) connection -> call.
-///   On failure (connect error / transport error / timeout) the
-///   connection is dropped and the call is retried on a DIFFERENT
-///   endpoint (up to kMaxAttempts), which gives basic failover for
-///   free: kill a server mid-run and calls continue on the rest.
+///   endpoints -> LB pick -> pooled lease -> call.
+///   On failure (connect error / transport error / timeout) the lease
+///   is marked unhealthy (its connection is dropped, not recycled) and
+///   the call is retried on a DIFFERENT endpoint (up to kMaxAttempts),
+///   which gives basic failover for free: kill a server mid-run and
+///   calls continue on the rest.
 ///
 /// Retry semantics: a timed-out call may already have executed on the
 /// server, so a retry makes syncCall at-least-once. Idempotent
@@ -47,10 +51,14 @@ class RpcClient;
 /// IO threads), same rule as RpcClient::syncCall.
 class ServiceConsumer : noncopyable {
 public:
-    /// `loop` backs all cached client connections.
+    /// Default per-endpoint pool size.
+    static constexpr size_t kDefaultPoolSize = 4;
+
+    /// `loop` backs all pooled client connections. `poolSizePerEndpoint`
+    /// bounds how many multiplexed connections are kept per endpoint.
     ServiceConsumer(EventLoop* loop, zk::ZkClient* zk,
-                    LoadBalancerPtr lb,
-                    std::string basePath = "/AetherRPC");
+                    LoadBalancerPtr lb, std::string basePath = "/AetherRPC",
+                    size_t poolSizePerEndpoint = kDefaultPoolSize);
     ~ServiceConsumer();
 
     ServiceConsumer(const ServiceConsumer&) = delete;
@@ -79,19 +87,19 @@ private:
     /// (a dead endpoint must not eat the whole budget before failover).
     static constexpr int kConnectBudgetMs = 1000;
 
-    /// Get-or-create the cached RpcClient for "host:port"; nullptr on
-    /// connect failure (the failed entry is evicted).
-    std::shared_ptr<RpcClient> connectionFor(const std::string& addr,
-                                             int connectTimeoutMs);
-    void dropConnection(const std::string& addr);
+    /// Get-or-create the pool for "host:port". The reference stays
+    /// valid for the consumer's lifetime (pools are never erased
+    /// individually; they all die in the destructor).
+    ConnectionPool& poolFor(const std::string& addr);
 
     EventLoop* loop_;
     zk::ZkClient* zk_;
     LoadBalancerPtr lb_;
     ServiceDiscovery discovery_;
+    const size_t poolSize_;
 
-    std::mutex connMtx_;
-    std::map<std::string, std::shared_ptr<RpcClient>> conns_;
+    std::mutex poolMtx_;
+    std::map<std::string, std::unique_ptr<ConnectionPool>> pools_;
 };
 
 }  // namespace rpc
