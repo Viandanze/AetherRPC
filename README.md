@@ -112,6 +112,21 @@ make -j$(nproc)
 ctest            # 8 suites: net regression + codec + rpc e2e + LB + zk + phase3
 ```
 
+### Test accounting (measured 2026-10-16, Ubuntu 20.04 VM, g++ 9.4)
+
+Three assertion counts exist because they are three different
+measurements of the same suites:
+
+| Count | Meaning |
+|-------|---------|
+| **241** | Static `ASSERT_*` macro count across the 8 test sources |
+| **255** | Runtime assertions with a ZooKeeper server running - `test_rpc_phase3` executes some assertions inside loops (70 runtime vs 56 static) |
+| **221** | Runtime without ZooKeeper: `test_zk_dist` detects no server via `zkReachable()` and takes its SKIP branch (34 assertions not executed), 255 - 34 |
+
+Run the suite binaries directly for per-suite counts
+(`Total: X | Passed: Y | Failed: Z`; codec/e2e print
+`N assertions, N passed, 0 failed`).
+
 ## Quick start
 
 Server:
