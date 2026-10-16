@@ -122,6 +122,7 @@ measurements of the same suites:
 | **241** | Static `ASSERT_*` macro count across the 8 test sources |
 | **255** | Runtime assertions with a ZooKeeper server running - `test_rpc_phase3` executes some assertions inside loops (70 runtime vs 56 static) |
 | **221** | Runtime without ZooKeeper: `test_zk_dist` detects no server via `zkReachable()` and takes its SKIP branch (34 assertions not executed), 255 - 34 |
+| **ASan** | Full suite also passes 15 consecutive rounds under `-fsanitize=address` (2026-10-16, same VM) |
 
 Run the suite binaries directly for per-suite counts
 (`Total: X | Passed: Y | Failed: Z`; codec/e2e print
